@@ -10,6 +10,7 @@ from io import BytesIO
 import html
 import yfinance as yf
 from pycoingecko import CoinGeckoAPI
+from PIL import Image  # ← добавили Pillow для автосжатия
 
 # ===== CONFIG =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -26,6 +27,9 @@ if not os.path.exists(IMAGES_DIR):
 
 # Путь к статичному изображению
 STATIC_IMAGE_PATH = os.path.join(IMAGES_DIR, "morning_digest_static.png")
+
+# Высота итоговой картинки (ширина сохраняется). Можно поменять через переменную окружения.
+TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "750"))
 
 CRYPTO_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -104,6 +108,32 @@ def load_static_image():
     except Exception as e:
         print(f"❌ Ошибка загрузки изображения: {e}")
         return None
+
+def resize_image_height(image_bytes, target_height=750):
+    """
+    Уменьшает высоту картинки до target_height, сохраняя ширину (например, 1024→1024x750).
+    Если высота уже <= target_height, возвращает исходную.
+    Сохраняем в PNG.
+    """
+    try:
+        img = Image.open(image_bytes)
+        width, height = img.size
+
+        # если уже не выше — просто вернуть
+        if height <= target_height:
+            image_bytes.seek(0)
+            return image_bytes
+
+        new_size = (width, target_height)
+        resized = img.resize(new_size, Image.Resampling.LANCZOS)
+        out = BytesIO()
+        resized.save(out, format="PNG")
+        out.seek(0)
+        return out
+    except Exception as e:
+        print(f"❌ Ошибка изменения высоты изображения: {e}")
+        image_bytes.seek(0)
+        return image_bytes
 
 # ===== DATA VALIDATION =====
 def validate_market_data(data_type, current_value, change_percent):
@@ -391,8 +421,8 @@ async def get_crypto_data():
         return None
 
 async def get_morning_image():
-    """Получение изображения для утренней сводки - улучшенная версия"""
-    # Проверяем, есть ли уже сохраненное изображение
+    """Получение изображения для утренней сводки - улучшенная версия (одноразовая генерация + автосжатие по высоте)"""
+    # 1) Проверяем, есть ли уже сохраненное изображение
     if static_image_exists():
         print("✅ Используем сохраненное статичное изображение")
         cached_image = load_static_image()
@@ -418,6 +448,7 @@ async def get_morning_image():
             "No text or words visible."
         )
 
+        # Генерируем квадрат 1024x1024 (как и раньше)
         resp = await client.images.generate(
             model="dall-e-3",
             prompt=prompt,
@@ -428,12 +459,21 @@ async def get_morning_image():
         img_url = resp.data[0].url
         image_bytes = BytesIO(requests.get(img_url).content)
 
-        # Сохраняем изображение навсегда
-        if save_static_image(image_bytes):
-            return image_bytes
+        # ↓↓↓ Новое: автоматическое уменьшение высоты до TARGET_IMAGE_HEIGHT (по умолчанию 750)
+        resized = resize_image_height(image_bytes, target_height=TARGET_IMAGE_HEIGHT)
+
+        # Сохраняем уменьшенную картинку «навсегда» (в кэш)
+        if save_static_image(resized):
+            # читаем из файла, чтобы далее всегда шло из памяти/файла
+            cached = load_static_image()
+            if cached:
+                return cached
+            resized.seek(0)
+            return resized
         else:
             print("⚠️ Не удалось сохранить изображение, используем временное")
-            return image_bytes
+            resized.seek(0)
+            return resized
 
     except Exception as e:
         print(f"❌ Ошибка генерации изображения: {e}")
@@ -498,7 +538,7 @@ async def ai_format_morning_digest_compact_final(news_list, market_data, crypto_
 
 async def send_morning_digest():
     """Отправка утренней сводки в Telegram"""
-    print("�� Запуск утренней сводки...")
+    print("🚀 Запуск утренней сводки...")
 
     # Получаем новости
     print("📰 Получаем новости из RSS...")
@@ -520,7 +560,7 @@ async def send_morning_digest():
     # Добавляем крипто-данные (компактно)
     crypto_section = ""
     if crypto_data:
-        crypto_section = "\n\n�� Криптовалюты (ТОП-5)\n"
+        crypto_section = "\n\n💎 Криптовалюты (ТОП-5)\n"
 
         if "bitcoin" in crypto_data:
             btc_price = crypto_data["bitcoin"]["usd"]
@@ -547,14 +587,14 @@ async def send_morning_digest():
             sol_change = crypto_data["solana"]["usd_24h_change"]
             crypto_section += f"SOL ${sol_price:.0f}({sol_change:+.1f}%)\n"
     else:
-        crypto_section = "\n\n�� Криптовалюты (ТОП-5)\nДанные недоступны"
+        crypto_section = "\n\n💎 Криптовалюты (ТОП-5)\nДанные недоступны"
 
     # Формируем полный пост
     full_post = f"🌅 Утренняя сводка — {datetime.datetime.now().strftime('%d.%m.%Y')}\n\n{digest}{crypto_section}\n\n{SIGNATURE}"
 
     # Проверяем длину
     post_length = len(full_post)
-    print(f"�� Длина поста: {post_length} символов")
+    print(f"🧮 Длина поста: {post_length} символов")
 
     # Если превышает лимит, убираем крипто-секцию
     if post_length > 1024:
@@ -617,7 +657,7 @@ async def send_morning_digest():
     print(f"• Изображение: {'✅ (статичное)' if static_image_exists() else '❌'}")
 
     # Показываем источники новостей
-    print(f"\n�� ИСТОЧНИКИ НОВОСТЕЙ:")
+    print(f"\n🗂️ ИСТОЧНИКИ НОВОСТЕЙ:")
     sources = {}
     for news in news_list:
         domain = news['source'].split('/')[2] if '//' in news['source'] else news['source']
