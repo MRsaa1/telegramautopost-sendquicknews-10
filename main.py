@@ -1,34 +1,42 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
-import datetime
+import re
+import html
 import asyncio
 import feedparser
 import openai
 from telegram import Bot
-import re
 import requests
+import datetime as dt
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from io import BytesIO
-import html
+from difflib import SequenceMatcher
+from urllib.parse import urlparse
+
 import yfinance as yf
 from pycoingecko import CoinGeckoAPI
-from PIL import Image  # ← добавили Pillow для автосжатия
+from PIL import Image  # Pillow для автосжатия
 
 # ===== CONFIG =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_RU = "-1002597393191"
 
+# Сколько новостей пытаемся показать
 NEWS_COUNT = 15
 SIGNATURE = "С вами был ReserveOne ☕️"
 
-# Создаем папку для изображений
+# Таймзона и «утреннее окно свежести»
+LOCAL_TZ = ZoneInfo("Europe/Vienna")
+FRESHNESS_HOURS_MORNING = int(os.getenv("FRESHNESS_HOURS_MORNING", "18"))  # только последние 18ч
+
+# Изображение (кешируем и уменьшаем высоту)
 IMAGES_DIR = "images"
-if not os.path.exists(IMAGES_DIR):
-    os.makedirs(IMAGES_DIR)
-
-# Путь к статичному изображению
+os.makedirs(IMAGES_DIR, exist_ok=True)
 STATIC_IMAGE_PATH = os.path.join(IMAGES_DIR, "morning_digest_static.png")
-
-# Высота итоговой картинки (ширина сохраняется). Можно поменять через переменную окружения.
 TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "750"))
 
 CRYPTO_FEEDS = [
@@ -37,7 +45,6 @@ CRYPTO_FEEDS = [
     "https://decrypt.co/feed",
     "https://theblock.co/rss",
 ]
-
 FINANCE_FEEDS = [
     "https://www.bloomberg.com/feed/podcast/etf-report.xml",
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
@@ -47,85 +54,51 @@ FINANCE_FEEDS = [
     "https://www.cnbc.com/id/15839135/device/rss/rss.html",
     "https://www.investing.com/rss/news_301.rss",
     "https://www.investing.com/rss/news_25.rss",
-    "https://www.morningbrew.com/feed.xml"
+    "https://www.morningbrew.com/feed.xml",
 ]
 
-# ===== IMAGE FUNCTIONS =====
-def static_image_exists():
-    """Проверяет, существует ли статичное изображение и оно не повреждено"""
-    if not os.path.exists(STATIC_IMAGE_PATH):
+# ===== IMAGE UTILS =====
+def static_image_exists() -> bool:
+    try:
+        return os.path.exists(STATIC_IMAGE_PATH) and os.path.getsize(STATIC_IMAGE_PATH) > 1024
+    except Exception:
         return False
 
-    # Проверяем размер файла (должен быть больше 1KB)
+def save_static_image(image_bytes: BytesIO) -> bool:
     try:
-        file_size = os.path.getsize(STATIC_IMAGE_PATH)
-        if file_size < 1024:  # Меньше 1KB - файл повреждён
-            print(f"⚠️ Файл изображения повреждён (размер: {file_size} байт)")
-            return False
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка проверки файла изображения: {e}")
-        return False
-
-def save_static_image(image_bytes):
-    """Сохраняет статичное изображение с проверкой"""
-    try:
-        # Создаём папку если её нет
-        os.makedirs(IMAGES_DIR, exist_ok=True)
-
-        # Сохраняем во временный файл сначала
         temp_path = STATIC_IMAGE_PATH + ".tmp"
-        with open(temp_path, 'wb') as f:
+        with open(temp_path, "wb") as f:
             f.write(image_bytes.getvalue())
-
-        # Проверяем что файл сохранился корректно
-        if os.path.exists(temp_path) and os.path.getsize(temp_path) > 1024:
-            # Перемещаем в финальное место
-            os.rename(temp_path, STATIC_IMAGE_PATH)
+        if os.path.getsize(temp_path) > 1024:
+            os.replace(temp_path, STATIC_IMAGE_PATH)
             print(f"✅ Статичное изображение сохранено: {STATIC_IMAGE_PATH}")
             return True
-        else:
-            print("❌ Ошибка сохранения изображения")
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            return False
-
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return False
     except Exception as e:
         print(f"❌ Ошибка сохранения изображения: {e}")
         return False
 
-def load_static_image():
-    """Загружает статичное изображение с проверкой"""
+def load_static_image() -> BytesIO | None:
     try:
-        if os.path.exists(STATIC_IMAGE_PATH):
-            with open(STATIC_IMAGE_PATH, 'rb') as f:
-                image_data = f.read()
-                if len(image_data) > 1024:  # Проверяем размер
-                    return BytesIO(image_data)
-                else:
-                    print("⚠️ Загруженное изображение слишком маленькое")
-        return None
+        if os.path.exists(STATIC_IMAGE_PATH) and os.path.getsize(STATIC_IMAGE_PATH) > 1024:
+            with open(STATIC_IMAGE_PATH, "rb") as f:
+                buf = BytesIO(f.read())
+                buf.seek(0)
+                return buf
     except Exception as e:
         print(f"❌ Ошибка загрузки изображения: {e}")
-        return None
+    return None
 
-def resize_image_height(image_bytes, target_height=750):
-    """
-    Уменьшает высоту картинки до target_height, сохраняя ширину (например, 1024→1024x750).
-    Если высота уже <= target_height, возвращает исходную.
-    Сохраняем в PNG.
-    """
+def resize_image_height(image_bytes: BytesIO, target_height: int = 750) -> BytesIO:
     try:
         img = Image.open(image_bytes)
-        width, height = img.size
-
-        # если уже не выше — просто вернуть
-        if height <= target_height:
+        w, h = img.size
+        if h <= target_height:
             image_bytes.seek(0)
             return image_bytes
-
-        new_size = (width, target_height)
-        resized = img.resize(new_size, Image.Resampling.LANCZOS)
+        resized = img.resize((w, target_height), Image.Resampling.LANCZOS)
         out = BytesIO()
         resized.save(out, format="PNG")
         out.seek(0)
@@ -135,537 +108,415 @@ def resize_image_height(image_bytes, target_height=750):
         image_bytes.seek(0)
         return image_bytes
 
-# ===== DATA VALIDATION =====
-def validate_market_data(data_type, current_value, change_percent):
-    """Валидация рыночных данных на разумность"""
-    validation_rules = {
+# ===== NEWS FRESHNESS/SCORING =====
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _strip_tags(s: str) -> str:
+    return re.sub(r"<.*?>", "", s or "").strip()
+
+def _unescape_then_escape(s: str) -> str:
+    s = html.unescape(s or "")
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return s
+
+def _norm_title(t: str) -> str:
+    t = _strip_tags(t or "")
+    t = re.sub(r"[\[\]\(\){}“”\"'«»•·\-–—:;,.!?]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
+
+def _similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+def is_quality_news(title: str, summary: str) -> bool:
+    text = f"{title} {summary}".lower()
+    if len(title) < 10 or len(summary) < 20:
+        return False
+    # меньше агрессивных стоп-слов — чтобы не выкидывать нормальные заметки
+    spam = [
+        "click here","subscribe","newsletter","advertisement","sponsored","promotion",
+        "подпишитесь","реклама"
+    ]
+    if any(k in text for k in spam):
+        return False
+    has_numbers = bool(re.search(r"\$\s?\d[\d.,]*|\d+%|\d+\.\d+", text))
+    has_event = any(w in text for w in [
+        "earnings","revenue","profit","loss","ipo","merger","acquisition",
+        "rate","inflation","gdp","unemployment","fed","ecb","sec",
+        "bitcoin","ethereum","crypto","stock","market","выручка","прибыль","ставка","инфляция","биткоин","акции"
+    ])
+    return has_numbers or has_event
+
+def score_item(n: dict) -> int:
+    score = 0
+    text = f"{n.get('title','')} {n.get('summary','')}".lower()
+    if re.search(r"\b(биткоин|bitcoin|btc|ethereum|eth|crypto|blockchain)\b", text):
+        score += 100
+    if re.search(r"\$\s?\d[\d.,]*|\d+%|\d+\.\d+", text):
+        score += 40
+    host = (urlparse(n.get("link") or "").hostname or "").lower()
+    for src, val in {
+        "bloomberg.com": 20,"reuters.com": 20,"cnbc.com": 15,"coindesk.com": 15,
+        "cointelegraph.com": 12,"marketwatch.com": 10,"investing.com": 8,"morningbrew.com": 4,
+    }.items():
+        if src in host:
+            score += val
+    age = float(n.get("age_hours") or 999.0)
+    # экспоненциальный штраф за возраст — утренним постам важна свежесть
+    score -= int(age ** 1.1)
+    return score
+
+def get_feed_news(feeds: list[str], max_news: int) -> list[dict]:
+    entries: list[dict] = []
+    now = _utcnow()
+
+    for url in feeds:
+        try:
+            d = feedparser.parse(url)
+            if not d.entries:
+                continue
+            for entry in d.entries:
+                st = entry.get("published_parsed") or entry.get("updated_parsed")
+                if not st:
+                    continue
+                published_dt = datetime(*st[:6], tzinfo=timezone.utc)
+                age_hours = (now - published_dt).total_seconds() / 3600.0
+                # Жёстко отсекаем старше утреннего окна
+                if age_hours > FRESHNESS_HOURS_MORNING:
+                    continue
+
+                title = _unescape_then_escape(_strip_tags(entry.get("title") or ""))
+                summary = _unescape_then_escape(_strip_tags(entry.get("summary") or ""))
+                link = (entry.get("link") or "").strip()
+                if not (title or summary):
+                    continue
+                if not is_quality_news(title, summary):
+                    continue
+
+                item = {
+                    "title": title,
+                    "title_norm": _norm_title(title),
+                    "summary": summary,
+                    "link": link,
+                    "source": url,
+                    "published_dt": published_dt,
+                    "age_hours": age_hours,
+                }
+                entries.append(item)
+        except Exception as e:
+            print(f"⚠️ Feed error ({url}): {e}")
+
+    if not entries:
+        return []
+
+    # дедуп по ссылке
+    seen, uniq = set(), []
+    for e in entries:
+        lk = e.get("link") or ""
+        if lk and lk not in seen:
+            seen.add(lk)
+            uniq.append(e)
+
+    # анти-дубль по заголовкам (семантика)
+    filtered: list[dict] = []
+    for e in uniq:
+        if any(_similar(e["title_norm"], x["title_norm"]) > 0.92 for x in filtered):
+            continue
+        filtered.append(e)
+
+    # скоринг + сортировка: score desc, при равенстве — свежее выше
+    for n in filtered:
+        n["score"] = score_item(n)
+    filtered.sort(key=lambda x: (x["score"], -x["published_dt"].timestamp()), reverse=True)
+
+    # берём запас (×2), потом урежем до max_news
+    return filtered[: max_news * 2]
+
+def filter_by_importance(news_list: list[dict], take: int) -> list[dict]:
+    # у нас уже есть score; просто доберём финальный список с балансом
+    return news_list[:take]
+
+# ===== MARKET DATA =====
+def validate_market_data(data_type, current_value, change_percent) -> bool:
+    rules = {
         "sp500": {"min": 2000, "max": 8000, "change_max": 10},
         "nasdaq": {"min": 5000, "max": 25000, "change_max": 10},
         "dxy": {"min": 80, "max": 120, "change_max": 5},
         "gold": {"min": 1000, "max": 3000, "change_max": 8},
         "oil": {"min": 20, "max": 150, "change_max": 15},
-        "treasury": {"min": 0, "max": 10, "change_max": 2}
+        "treasury": {"min": 0, "max": 10, "change_max": 2},
     }
-
-    if data_type not in validation_rules:
+    if data_type not in rules:
         return True
-
-    rules = validation_rules[data_type]
-
-    # Проверяем разумность значения
-    if not (rules["min"] <= current_value <= rules["max"]):
+    r = rules[data_type]
+    if not (r["min"] <= current_value <= r["max"]):
         print(f"⚠️ Подозрительное значение {data_type}: {current_value}")
         return False
-
-    # Проверяем разумность изменения
-    if abs(change_percent) > rules["change_max"]:
+    if abs(change_percent) > r["change_max"]:
         print(f"⚠️ Подозрительное изменение {data_type}: {change_percent:.2f}%")
         return False
-
     return True
 
-# ===== HELPERS =====
-def get_feed_news(feeds, max_news):
-    entries = []
-    for url in feeds:
-        try:
-            d = feedparser.parse(url)
-            for entry in d.entries:
-                entry.source_url = url
-            entries.extend(d.entries)
-        except Exception as e:
-            print(f"Error parsing {url}: {e}")
-
-    entries = sorted(
-        entries,
-        key=lambda e: e.get("published_parsed", datetime.datetime.now().timetuple()),
-        reverse=True
-    )
-
-    seen, fresh_news = set(), []
-    for e in entries:
-        link = e.get("link", "").strip()
-        if link and link not in seen:
-            seen.add(link)
-            title = re.sub(r"<.*?>", "", e.get("title", "").strip())
-            summary = re.sub(r"<.*?>", "", e.get("summary", "").strip())
-
-            # Улучшенный фильтр новостей
-            if is_quality_news(title, summary):
-                fresh_news.append({
-                    "title": title,
-                    "summary": summary,
-                    "link": link,
-                    "source": getattr(e, "source_url", "")
-                })
-        if len(fresh_news) >= max_news * 2:  # Берем больше для фильтрации
-            break
-
-    # Дополнительная фильтрация по важности
-    fresh_news = filter_by_importance(fresh_news)
-    return fresh_news[:max_news]
-
-def is_quality_news(title, summary):
-    """Улучшенный фильтр качества новостей по топ-7 категориям"""
-    text = f"{title} {summary}".lower()
-
-    # Исключаем мусорные новости
-    spam_keywords = [
-        "click here", "subscribe", "newsletter", "advertisement", "sponsored",
-        "clickbait", "you won't believe", "shocking", "amazing", "incredible",
-        "breaking news", "urgent", "exclusive", "limited time", "act now",
-        "free", "bonus", "discount", "sale", "offer", "deal", "promotion",
-        "click to read", "read more", "continue reading", "full story",
-        "подпишитесь", "реклама", "акция", "скидка", "бесплатно", "эксклюзив",
-        "шокирующие", "невероятные", "срочно", "ограниченное время",
-        # Добавляем новые фильтры
-        "ожидает", "может", "возможно", "призывает", "сообщает источник",
-        "согласно источникам", "анонимные источники", "слухи"
-    ]
-
-    for keyword in spam_keywords:
-        if keyword in text:
-            return False
-
-    # Проверяем на минимальную длину
-    if len(title) < 10 or len(summary) < 20:
-        return False
-
-    # Усиливаем требования к конкретности
-    has_specific_data = bool(re.search(r'\$\d+|\d+%|\d+\.\d+', text))
-    has_concrete_event = any(word in text for word in [
-        "earnings", "revenue", "profit", "loss", "ipo", "merger", "acquisition",
-        "rate", "inflation", "gdp", "unemployment", "fed", "ecb", "sec",
-        "bitcoin", "ethereum", "crypto", "stock", "market", "trade",
-        "выручка", "прибыль", "ставка", "инфляция", "биткоин", "акции"
-    ])
-
-    return has_specific_data or has_concrete_event
-
-def filter_by_importance(news_list):
-    """Дополнительная фильтрация по важности с приоритетом категориям"""
-    scored_news = []
-
-    for news in news_list:
-        score = 0
-        text = f"{news['title']} {news['summary']}".lower()
-
-        # Баллы за важные категории (приоритет)
-        category_scores = {
-            "crypto": 15,       # Криптовалюты - высший приоритет
-            "monetary": 13,     # Центробанки и регуляторы
-            "corporate": 12,    # Корпоративные новости
-            "markets": 12,      # Макроэкономика
-            "geopolitics": 8,   # Геополитика
-            "innovation": 8,    # Инновации
-            "alternative": 6    # Альтернативные активы
-        }
-
-        # Проверяем каждую категорию
-        if any(word in text for word in ["s&p 500", "nasdaq", "dow", "cpi", "gdp", "inflation", "федеральная резервная система", "фрс"]):
-            score += category_scores["markets"]
-        if any(word in text for word in ["federal reserve", "fed", "ecb", "regulation", "sec", "федеральная резервная система", "регулирование"]):
-            score += category_scores["monetary"]
-        if any(word in text for word in ["apple", "microsoft", "nvidia", "tesla", "earnings", "revenue", "акции", "выручка"]):
-            score += category_scores["corporate"]
-        if any(word in text for word in ["bitcoin", "btc", "ethereum", "eth", "crypto", "биткоин", "эфириум"]):
-            score += category_scores["crypto"]
-        if any(word in text for word in ["china", "russia", "trade war", "sanctions", "китай", "санкции"]):
-            score += category_scores["geopolitics"]
-        if any(word in text for word in ["ai", "artificial intelligence", "chatgpt", "искусственный интеллект"]):
-            score += category_scores["innovation"]
-        if any(word in text for word in ["real estate", "venture capital", "недвижимость"]):
-            score += category_scores["alternative"]
-
-        # Бонус за цифры
-        if re.search(r'\$\d+', text):
-            score += 3
-        if re.search(r'\d+%', text):
-            score += 2
-
-        # Бонус за надежные источники
-        reliable_sources = ['bloomberg', 'reuters', 'cnbc', 'coindesk', 'cointelegraph', 'marketwatch']
-        if any(source in news['source'] for source in reliable_sources):
-            score += 3
-
-        scored_news.append((score, news))
-
-    # Сортируем по важности
-    scored_news.sort(key=lambda x: x[0], reverse=True)
-    return [news for score, news in scored_news]
-
 async def get_market_data():
-    """Получение актуальных рыночных данных - ИСПРАВЛЕННАЯ версия"""
     try:
         print("📊 Получаем рыночные данные...")
+        sp500 = yf.download("^GSPC", period="2d", interval="1d", auto_adjust=False)
+        nasdaq = yf.download("^IXIC", period="2d", interval="1d", auto_adjust=False)
+        dxy = yf.download("DX-Y.NYB", period="2d", interval="1d", auto_adjust=False)
+        gold = yf.download("GC=F", period="2d", interval="1d", auto_adjust=False)
+        oil = yf.download("BZ=F", period="2d", interval="1d", auto_adjust=False)
+        tnx = yf.download("^TNX", period="2d", interval="1d", auto_adjust=False)
 
-        # Фондовые индексы - получаем данные за 2 дня для корректного расчета изменений
-        sp500_data = yf.download("^GSPC", period="2d", interval="1d", auto_adjust=False)
-        nasdaq_data = yf.download("^IXIC", period="2d", interval="1d", auto_adjust=False)
-        dax_data = yf.download("^GDAXI", period="2d", interval="1d", auto_adjust=False)
-
-        # Валюты и сырье - ИСПРАВЛЕНО: используем правильный символ для DXY
-        dxy_data = yf.download("DX-Y.NYB", period="2d", interval="1d", auto_adjust=False)
-        gold_data = yf.download("GC=F", period="2d", interval="1d", auto_adjust=False)
-        oil_data = yf.download("BZ=F", period="2d", interval="1d", auto_adjust=False)
-
-        # Трежерис
-        treasury_data = yf.download("^TNX", period="2d", interval="1d", auto_adjust=False)
-
-        # Получаем текущие цены и изменения
         market_data = {}
 
-        # S&P 500
-        if not sp500_data.empty and len(sp500_data) >= 2:
-            sp500_current = float(sp500_data["Close"].iloc[-1])
-            sp500_prev = float(sp500_data["Close"].iloc[-2])
-            sp500_change = ((sp500_current - sp500_prev) / sp500_prev * 100)
+        def _pair(df):
+            if df.empty or len(df) < 2:
+                return None
+            cur = float(df["Close"].iloc[-1])
+            prev = float(df["Close"].iloc[-2])
+            chg = (cur - prev) / prev * 100
+            return cur, chg
 
-            if validate_market_data("sp500", sp500_current, sp500_change):
-                market_data["sp500"] = (sp500_current, sp500_change)
-                print(f"✅ S&P 500: ${sp500_current:.2f} ({sp500_change:+.2f}%)")
-            else:
-                print(f"❌ S&P 500: данные не прошли валидацию")
+        sp = _pair(sp500)
+        if sp and validate_market_data("sp500", sp[0], sp[1]):
+            market_data["sp500"] = sp
 
-        # Nasdaq
-        if not nasdaq_data.empty and len(nasdaq_data) >= 2:
-            nasdaq_current = float(nasdaq_data["Close"].iloc[-1])
-            nasdaq_prev = float(nasdaq_data["Close"].iloc[-2])
-            nasdaq_change = ((nasdaq_current - nasdaq_prev) / nasdaq_prev * 100)
+        ndq = _pair(nasdaq)
+        if ndq and validate_market_data("nasdaq", ndq[0], ndq[1]):
+            market_data["nasdaq"] = ndq
 
-            if validate_market_data("nasdaq", nasdaq_current, nasdaq_change):
-                market_data["nasdaq"] = (nasdaq_current, nasdaq_change)
-                print(f"✅ Nasdaq: ${nasdaq_current:.2f} ({nasdaq_change:+.2f}%)")
-            else:
-                print(f"❌ Nasdaq: данные не прошли валидацию")
+        dx = _pair(dxy)
+        if dx and validate_market_data("dxy", dx[0], dx[1]):
+            market_data["dxy"] = dx
 
-        # DXY - ИСПРАВЛЕНО
-        if not dxy_data.empty and len(dxy_data) >= 2:
-            dxy_current = float(dxy_data["Close"].iloc[-1])
-            dxy_prev = float(dxy_data["Close"].iloc[-2])
-            dxy_change = ((dxy_current - dxy_prev) / dxy_prev * 100)
+        au = _pair(gold)
+        if au and validate_market_data("gold", au[0], au[1]):
+            market_data["gold"] = au
 
-            if validate_market_data("dxy", dxy_current, dxy_change):
-                market_data["dxy"] = (dxy_current, dxy_change)
-                print(f"✅ DXY: {dxy_current:.2f} ({dxy_change:+.2f}%)")
-            else:
-                print(f"❌ DXY: данные не прошли валидацию")
+        br = _pair(oil)
+        if br and validate_market_data("oil", br[0], br[1]):
+            market_data["oil"] = br
 
-        # Золото
-        if not gold_data.empty and len(gold_data) >= 2:
-            gold_current = float(gold_data["Close"].iloc[-1])
-            gold_prev = float(gold_data["Close"].iloc[-2])
-            gold_change = ((gold_current - gold_prev) / gold_prev * 100)
+        tn = _pair(tnx)
+        if tn and validate_market_data("treasury", tn[0], tn[1]):
+            market_data["treasury"] = tn
 
-            if validate_market_data("gold", gold_current, gold_change):
-                market_data["gold"] = (gold_current, gold_change)
-                print(f"✅ Золото: ${gold_current:.2f} ({gold_change:+.2f}%)")
-            else:
-                print(f"❌ Золото: данные не прошли валидацию")
-
-        # Нефть
-        if not oil_data.empty and len(oil_data) >= 2:
-            oil_current = float(oil_data["Close"].iloc[-1])
-            oil_prev = float(oil_data["Close"].iloc[-2])
-            oil_change = ((oil_current - oil_prev) / oil_prev * 100)
-
-            if validate_market_data("oil", oil_current, oil_change):
-                market_data["oil"] = (oil_current, oil_change)
-                print(f"✅ Нефть: ${oil_current:.2f} ({oil_change:+.2f}%)")
-            else:
-                print(f"❌ Нефть: данные не прошли валидацию")
-
-        # 10Y Treasury
-        if not treasury_data.empty and len(treasury_data) >= 2:
-            treasury_current = float(treasury_data["Close"].iloc[-1])
-            treasury_prev = float(treasury_data["Close"].iloc[-2])
-            treasury_change = ((treasury_current - treasury_prev) / treasury_prev * 100)
-
-            if validate_market_data("treasury", treasury_current, treasury_change):
-                market_data["treasury"] = (treasury_current, treasury_change)
-                print(f"✅ 10Y Treasury: {treasury_current:.2f}% ({treasury_change:+.2f}%)")
-            else:
-                print(f"❌ 10Y Treasury: данные не прошли валидацию")
+        # лог-вывод
+        for k, (v, c) in market_data.items():
+            unit = "$" if k in ("sp500", "nasdaq", "gold", "oil") else ""
+            print(f"✅ {k.upper()}: {unit}{v:.2f} ({c:+.2f}%)")
 
         return market_data
-
     except Exception as e:
         print(f"❌ Error fetching market data: {e}")
         return None
 
 async def get_crypto_data():
-    """Получение данных криптовалют"""
     try:
         print("💰 Получаем данные криптовалют...")
         cg = CoinGeckoAPI()
-        crypto_data = cg.get_price(
-            ids="bitcoin,ethereum,binancecoin,ripple,solana", 
-            vs_currencies="usd", 
-            include_24hr_change=True
+        data = cg.get_price(
+            ids="bitcoin,ethereum,binancecoin,ripple,solana",
+            vs_currencies="usd",
+            include_24hr_change=True,
         )
-
-        if crypto_data:
-            if "bitcoin" in crypto_data:
-                btc_price = crypto_data["bitcoin"]["usd"]
-                btc_change = crypto_data["bitcoin"]["usd_24h_change"]
-                print(f"✅ BTC: ${btc_price:,.0f} ({btc_change:+.2f}%)")
-
-            if "ethereum" in crypto_data:
-                eth_price = crypto_data["ethereum"]["usd"]
-                eth_change = crypto_data["ethereum"]["usd_24h_change"]
-                print(f"✅ ETH: ${eth_price:,.0f} ({eth_change:+.2f}%)")
-
-        return crypto_data
+        if data:
+            if "bitcoin" in data:
+                print(f"✅ BTC: ${data['bitcoin']['usd']:,.0f} ({data['bitcoin']['usd_24h_change']:+.2f}%)")
+            if "ethereum" in data:
+                print(f"✅ ETH: ${data['ethereum']['usd']:,.0f} ({data['ethereum']['usd_24h_change']:+.2f}%)")
+        return data
     except Exception as e:
         print(f"❌ Error fetching crypto data: {e}")
         return None
 
-async def get_morning_image():
-    """Получение изображения для утренней сводки - улучшенная версия (одноразовая генерация + автосжатие по высоте)"""
-    # 1) Проверяем, есть ли уже сохраненное изображение
+# ===== IMAGE GEN (1024x1024 → уменьшение высоты) =====
+async def get_morning_image() -> BytesIO | None:
     if static_image_exists():
-        print("✅ Используем сохраненное статичное изображение")
-        cached_image = load_static_image()
-        if cached_image:
-            return cached_image
-        else:
-            print("⚠️ Кэшированное изображение повреждено, генерируем новое...")
+        print("✅ Используем сохранённое статичное изображение")
+        cached = load_static_image()
+        if cached:
+            return cached
+        print("⚠️ Кэш повреждён — генерирую новое…")
 
-    print("🎨 Генерируем новое статичное изображение (только один раз)...")
-
+    print("🎨 Генерируем новое статичное изображение…")
     try:
         client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
         prompt = (
             "Digital illustration, fun but professional, modern flat style, soft colors. "
-            "A minimalist composition featuring: "
-            "A flat-designed coffee cup with steam rising in geometric shapes, "
-            "a newspaper with clean typography and flat icons representing finance and crypto, "
-            "geometric charts and graphs in pastel colors, "
-            "flat design elements like coins, charts, and market symbols. "
-            "Color palette: soft pastels (dusty rose, mint green, lavender, warm beige). "
-            "Clean lines, no gradients, modern flat design aesthetic. "
-            "Professional yet friendly financial morning theme. "
-            "No text or words visible."
+            "Minimalist morning finance theme: coffee cup, newspaper icons, coins, charts. "
+            "Clean lines, soft pastel palette. No text."
         )
-
-        # Генерируем квадрат 1024x1024 (как и раньше)
         resp = await client.images.generate(
             model="dall-e-3",
             prompt=prompt,
             n=1,
-            size="1024x1024"
+            size="1024x1024",
         )
-
         img_url = resp.data[0].url
-        image_bytes = BytesIO(requests.get(img_url).content)
+        buf = BytesIO(requests.get(img_url, timeout=20).content)
 
-        # ↓↓↓ Новое: автоматическое уменьшение высоты до TARGET_IMAGE_HEIGHT (по умолчанию 750)
-        resized = resize_image_height(image_bytes, target_height=TARGET_IMAGE_HEIGHT)
+        # уменьшаем ТОЛЬКО ВЫСОТУ (ширину не трогаем)
+        resized = resize_image_height(buf, target_height=TARGET_IMAGE_HEIGHT)
 
-        # Сохраняем уменьшенную картинку «навсегда» (в кэш)
         if save_static_image(resized):
-            # читаем из файла, чтобы далее всегда шло из памяти/файла
             cached = load_static_image()
             if cached:
                 return cached
-            resized.seek(0)
-            return resized
-        else:
-            print("⚠️ Не удалось сохранить изображение, используем временное")
-            resized.seek(0)
-            return resized
-
+        resized.seek(0)
+        return resized
     except Exception as e:
         print(f"❌ Ошибка генерации изображения: {e}")
         return None
 
+# ===== LLM DIGEST (compact) =====
 async def ai_format_morning_digest_compact_final(news_list, market_data, crypto_data):
-    """Финальная компактная версия с жестким контролем лимита - исправленная"""
     client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-    # Формируем строку с реальными данными
     real_data = ""
     if market_data:
         if "sp500" in market_data:
-            sp500_val, sp500_chg = market_data["sp500"]
-            real_data += f"S&P500 ${sp500_val:.0f}({sp500_chg:+.1f}%), "
+            v, c = market_data["sp500"]; real_data += f"S&P500 ${v:.0f}({c:+.1f}%), "
         if "nasdaq" in market_data:
-            nasdaq_val, nasdaq_chg = market_data["nasdaq"]
-            real_data += f"Nasdaq ${nasdaq_val:.0f}({nasdaq_chg:+.1f}%), "
+            v, c = market_data["nasdaq"]; real_data += f"Nasdaq ${v:.0f}({c:+.1f}%), "
         if "gold" in market_data:
-            gold_val, gold_chg = market_data["gold"]
-            real_data += f"Золото ${gold_val:.0f}({gold_chg:+.1f}%), "
+            v, c = market_data["gold"]; real_data += f"Золото ${v:.0f}({c:+.1f}%), "
         if "oil" in market_data:
-            oil_val, oil_chg = market_data["oil"]
-            real_data += f"Нефть ${oil_val:.0f}({oil_chg:+.1f}%), "
+            v, c = market_data["oil"]; real_data += f"Нефть ${v:.0f}({c:+.1f}%), "
         if "dxy" in market_data:
-            dxy_val, dxy_chg = market_data["dxy"]
-            real_data += f"DXY {dxy_val:.1f}({dxy_chg:+.1f}%), "
+            v, c = market_data["dxy"]; real_data += f"DXY {v:.1f}({c:+.1f}%), "
         if "treasury" in market_data:
-            treasury_val, treasury_chg = market_data["treasury"]
-            real_data += f"10Y {treasury_val:.1f}%({treasury_chg:+.1f}%)"
+            v, c = market_data["treasury"]; real_data += f"10Y {v:.1f}%({c:+.1f}%)"
+
+    # берём только заголовки (без ссылок/тел) — чтобы не было «вымышленной» инфы
+    news_titles = "\n".join([f"- {n['title']}" for n in news_list[:7]])
 
     prompt = f"""
-Сформируй КРАТКУЮ утреннюю сводку на русском языке (МАКСИМУМ 900 символов).
+Сформируй КРАТКУЮ утреннюю сводку на русском (МАКС 900 символов).
 Структура из 7 пунктов с эмодзи:
 
-1️⃣ Глобальные рынки (максимум 140 символов)
-2️⃣ Итоги торгов (максимум 120 символов) - используй: {real_data}
-3️⃣ Трежерис, DXY, золото, нефть (максимум 120 символов) - используй: {real_data}
-4️⃣ Монетарная политика (максимум 120 символов)
-5️⃣ Корпоративные новости (максимум 120 символов)
-6️⃣ Криптовалюты (максимум 160 символов)
-7️⃣ Геополитика (максимум 120 символов)
+1️⃣ Глобальные рынки (≤140) — используй: {real_data}
+2️⃣ Итоги торгов (≤120) — используй: {real_data}
+3️⃣ Трежерис, DXY, золото, нефть (≤120) — используй: {real_data}
+4️⃣ Монетарная политика (≤120) — используй: {real_data}
+5️⃣ Корпоративные новости (≤120) — используй: {real_data}
+6️⃣ Криптовалюты (≤160) — используй: {real_data}
+7️⃣ Геополитика (≤120) — используй: {real_data}
 
-⚠️ КРАТКО! Только ключевые факты. Используй ТОЛЬКО реальные данные выше.
-⚠️ НЕ ПРИДУМЫВАЙ цифры! Только из списка новостей.
+⚠️ КРАТКО. Только факты из списка новостей и {real_data}.
+⚠️ НЕ придумывай цифры. Если данных нет — пропусти.
 
 Новости:
-{chr(10).join([f"- {news['title']}" for news in news_list[:6]])}
+{news_titles}
 """
 
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "Ты — финансовый аналитик. Пиши КРАТКО, используй ТОЛЬКО предоставленные данные."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "Ты — финансовый редактор. Пиши очень кратко и фактологично."},
+            {"role": "user", "content": prompt},
         ],
         max_tokens=400,
-        temperature=0.1
+        temperature=0.2,
     )
+    return (resp.choices[0].message.content or "").strip()
 
-    return resp.choices[0].message.content.strip()
-
+# ===== MAIN SEND =====
 async def send_morning_digest():
-    """Отправка утренней сводки в Telegram"""
     print("🚀 Запуск утренней сводки...")
 
-    # Получаем новости
-    print("📰 Получаем новости из RSS...")
-    news_list = get_feed_news(CRYPTO_FEEDS + FINANCE_FEEDS, NEWS_COUNT)
-    if not news_list:
-        print("⚠️ Нет свежих новостей")
+    # 1) свежие новости за утреннее окно
+    print("📰 Получаем новости из RSS (только свежие)…")
+    pool = get_feed_news(CRYPTO_FEEDS + FINANCE_FEEDS, NEWS_COUNT)
+    if not pool:
+        print("⚠️ Нет свежих новостей в окне актуальности")
         return
 
-    print(f"✅ Найдено {len(news_list)} новостей")
+    # финальный список
+    news_list = filter_by_importance(pool, NEWS_COUNT)
+    print(f"✅ Отобрано {len(news_list)} актуальных новостей (≤ {FRESHNESS_HOURS_MORNING}ч)")
 
-    # Получаем реальные данные
+    # 2) рынки/крипта
     market_data = await get_market_data()
     crypto_data = await get_crypto_data()
 
-    # Формируем сводку с жестким контролем лимита
-    print("🤖 Формируем компактную сводку...")
+    # 3) текст сводки
+    print("🤖 Формируем компактную сводку…")
     digest = await ai_format_morning_digest_compact_final(news_list, market_data, crypto_data)
 
-    # Добавляем крипто-данные (компактно)
+    # 4) шапка с датой в Europe/Vienna
+    now_local = datetime.now(LOCAL_TZ)
+    header = f"🌅 Утренняя сводка — {now_local:%d.%m.%Y}"
+
+    # 5) крипто-блок (компактно)
     crypto_section = ""
     if crypto_data:
-        crypto_section = "\n\n💎 Криптовалюты (ТОП-5)\n"
-
+        parts = []
         if "bitcoin" in crypto_data:
-            btc_price = crypto_data["bitcoin"]["usd"]
-            btc_change = crypto_data["bitcoin"]["usd_24h_change"]
-            crypto_section += f"BTC ${btc_price:,.0f}({btc_change:+.1f}%)\n"
-
+            p = crypto_data["bitcoin"]["usd"]; c = crypto_data["bitcoin"]["usd_24h_change"]
+            parts.append(f"BTC ${p:,.0f}({c:+.1f}%)")
         if "ethereum" in crypto_data:
-            eth_price = crypto_data["ethereum"]["usd"]
-            eth_change = crypto_data["ethereum"]["usd_24h_change"]
-            crypto_section += f"ETH ${eth_price:,.0f}({eth_change:+.1f}%)\n"
-
+            p = crypto_data["ethereum"]["usd"]; c = crypto_data["ethereum"]["usd_24h_change"]
+            parts.append(f"ETH ${p:,.0f}({c:+.1f}%)")
         if "binancecoin" in crypto_data:
-            bnb_price = crypto_data["binancecoin"]["usd"]
-            bnb_change = crypto_data["binancecoin"]["usd_24h_change"]
-            crypto_section += f"BNB ${bnb_price:.0f}({bnb_change:+.1f}%)\n"
-
+            p = crypto_data["binancecoin"]["usd"]; c = crypto_data["binancecoin"]["usd_24h_change"]
+            parts.append(f"BNB ${p:.0f}({c:+.1f}%)")
         if "ripple" in crypto_data:
-            xrp_price = crypto_data["ripple"]["usd"]
-            xrp_change = crypto_data["ripple"]["usd_24h_change"]
-            crypto_section += f"XRP ${xrp_price:.2f}({xrp_change:+.1f}%)\n"
-
+            p = crypto_data["ripple"]["usd"]; c = crypto_data["ripple"]["usd_24h_change"]
+            parts.append(f"XRP ${p:.2f}({c:+.1f}%)")
         if "solana" in crypto_data:
-            sol_price = crypto_data["solana"]["usd"]
-            sol_change = crypto_data["solana"]["usd_24h_change"]
-            crypto_section += f"SOL ${sol_price:.0f}({sol_change:+.1f}%)\n"
-    else:
-        crypto_section = "\n\n💎 Криптовалюты (ТОП-5)\nДанные недоступны"
+            p = crypto_data["solana"]["usd"]; c = crypto_data["solana"]["usd_24h_change"]
+            parts.append(f"SOL ${p:.0f}({c:+.1f}%)")
+        if parts:
+            crypto_section = "\n\n💎 " + " · ".join(parts)
 
-    # Формируем полный пост
-    full_post = f"🌅 Утренняя сводка — {datetime.datetime.now().strftime('%d.%m.%Y')}\n\n{digest}{crypto_section}\n\n{SIGNATURE}"
+    # 6) собрать пост и уложить в лимит подписи к фото (1024)
+    full_post = f"{header}\n\n{digest}{crypto_section}\n\n{SIGNATURE}"
+    if len(full_post) > 1024:
+        # сначала уберём крипто-хвост
+        full_post = f"{header}\n\n{digest}\n\n{SIGNATURE}"
+        if len(full_post) > 1024:
+            excess = len(full_post) - 1021
+            digest_short = digest[:-excess].rstrip()
+            full_post = f"{header}\n\n{digest_short}…\n\n{SIGNATURE}"
 
-    # Проверяем длину
-    post_length = len(full_post)
-    print(f"🧮 Длина поста: {post_length} символов")
+    print(f"🧮 Длина поста: {len(full_post)} символов")
 
-    # Если превышает лимит, убираем крипто-секцию
-    if post_length > 1024:
-        print("⚠️ Пост превышает лимит, убираем крипто-секцию...")
-        full_post = f"🌅 Утренняя сводка — {datetime.datetime.now().strftime('%d.%m.%Y')}\n\n{digest}\n\n{SIGNATURE}"
-        post_length = len(full_post)
-        print(f"📏 Длина после сокращения: {post_length} символов")
+    # 7) получить/сжать картинку
+    print("🖼️ Готовим изображение…")
+    image = await get_morning_image()
 
-        # Если все еще превышает, обрезаем
-        if post_length > 1024:
-            print("⚠️ Все еще превышает, обрезаем...")
-            # Считаем сколько символов нужно убрать
-            excess = post_length - 1021  # 1021 + "..." = 1024
-            digest_shortened = digest[:-excess]
-            full_post = f"🌅 Утренняя сводка — {datetime.datetime.now().strftime('%d.%m.%Y')}\n\n{digest_shortened}...\n\n{SIGNATURE}"
-            post_length = len(full_post)
-            print(f"📏 Длина после обрезки: {post_length} символов")
-
-    # Получаем статичное изображение
-    print("🖼️ Получаем изображение...")
-    try:
-        image = await get_morning_image()
-        print("✅ Изображение готово")
-    except Exception as e:
-        print(f"❌ Ошибка работы с изображением: {e}")
-        image = None
-
-    # Отправляем в Telegram
-    print("📤 Отправляем в Telegram...")
+    # 8) отправка в Telegram
+    print("📤 Отправляем в Telegram…")
     try:
         bot = Bot(token=TELEGRAM_TOKEN)
-
         if image:
             await bot.send_photo(
                 chat_id=TELEGRAM_CHANNEL_RU,
                 photo=image,
                 caption=full_post,
-                parse_mode=None
+                parse_mode=None,
             )
             print("✅ Пост с изображением отправлен!")
         else:
             await bot.send_message(
                 chat_id=TELEGRAM_CHANNEL_RU,
                 text=full_post,
-                parse_mode=None
+                parse_mode=None,
             )
             print("✅ Пост без изображения отправлен!")
-
     except Exception as e:
         print(f"❌ Ошибка отправки в Telegram: {e}")
 
-    # Статистика
-    print(f"\n📊 СТАТИСТИКА:")
+    # 9) статистика
+    print("\n📊 СТАТИСТИКА:")
     print(f"• Новостей: {len(news_list)}")
     print(f"• Символов: {len(full_post)}")
-    print(f"• Слов: {len(full_post.split())}")
     print(f"• Рыночные данные: {'✅' if market_data else '❌'}")
     print(f"• Крипто-данные: {'✅' if crypto_data else '❌'}")
-    print(f"• Запас символов: {1024 - len(full_post)}")
-    print(f"• Изображение: {'✅ (статичное)' if static_image_exists() else '❌'}")
+    print(f"• Окно свежести: {FRESHNESS_HOURS_MORNING} ч")
+    print(f"• Картинка: {'✅' if image else '❌'}")
 
-    # Показываем источники новостей
-    print(f"\n🗂️ ИСТОЧНИКИ НОВОСТЕЙ:")
-    sources = {}
-    for news in news_list:
-        domain = news['source'].split('/')[2] if '//' in news['source'] else news['source']
-        sources[domain] = sources.get(domain, 0) + 1
-
-    for source, count in sources.items():
-        print(f"  • {source}: {count} новостей")
-
-# Запускаем отправку в Telegram
 if __name__ == "__main__":
     asyncio.run(send_morning_digest())
