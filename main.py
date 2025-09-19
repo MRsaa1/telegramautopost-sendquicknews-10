@@ -9,7 +9,6 @@ import feedparser
 import openai
 from telegram import Bot
 import requests
-import datetime as dt
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from io import BytesIO
@@ -25,7 +24,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_RU = "-1002597393191"
 
-# Сколько новостей пытаемся показать
 NEWS_COUNT = 15
 SIGNATURE = "С вами был ReserveOne ☕️"
 
@@ -33,11 +31,19 @@ SIGNATURE = "С вами был ReserveOne ☕️"
 LOCAL_TZ = ZoneInfo("Europe/Vienna")
 FRESHNESS_HOURS_MORNING = int(os.getenv("FRESHNESS_HOURS_MORNING", "18"))  # только последние 18ч
 
+# Источник рыночных данных: "last_close" (вчера vs позавчера) или "intraday"
+MARKET_SOURCE_MODE = os.getenv("MARKET_SOURCE_MODE", "last_close")  # last_close | intraday
+
 # Изображение (кешируем и уменьшаем высоту)
 IMAGES_DIR = "images"
 os.makedirs(IMAGES_DIR, exist_ok=True)
 STATIC_IMAGE_PATH = os.path.join(IMAGES_DIR, "morning_digest_static.png")
 TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "750"))
+
+# Баланс крипто/финансов (при желании — отрегулировать через env)
+CRYPTO_RATIO = float(os.getenv("CRYPTO_RATIO", "0.4"))          # целевая доля крипто в пуле
+MIN_FIN_NEWS = int(os.getenv("MIN_FIN_NEWS", "6"))              # минимум финновостей
+CRYPTO_KEYWORD_BONUS = int(os.getenv("CRYPTO_KEYWORD_BONUS", "50"))
 
 CRYPTO_FEEDS = [
     "https://cointelegraph.com/rss",
@@ -133,11 +139,7 @@ def is_quality_news(title: str, summary: str) -> bool:
     text = f"{title} {summary}".lower()
     if len(title) < 10 or len(summary) < 20:
         return False
-    # меньше агрессивных стоп-слов — чтобы не выкидывать нормальные заметки
-    spam = [
-        "click here","subscribe","newsletter","advertisement","sponsored","promotion",
-        "подпишитесь","реклама"
-    ]
+    spam = ["click here","subscribe","newsletter","advertisement","sponsored","promotion","подпишитесь","реклама"]
     if any(k in text for k in spam):
         return False
     has_numbers = bool(re.search(r"\$\s?\d[\d.,]*|\d+%|\d+\.\d+", text))
@@ -152,7 +154,7 @@ def score_item(n: dict) -> int:
     score = 0
     text = f"{n.get('title','')} {n.get('summary','')}".lower()
     if re.search(r"\b(биткоин|bitcoin|btc|ethereum|eth|crypto|blockchain)\b", text):
-        score += 100
+        score += CRYPTO_KEYWORD_BONUS
     if re.search(r"\$\s?\d[\d.,]*|\d+%|\d+\.\d+", text):
         score += 40
     host = (urlparse(n.get("link") or "").hostname or "").lower()
@@ -163,8 +165,7 @@ def score_item(n: dict) -> int:
         if src in host:
             score += val
     age = float(n.get("age_hours") or 999.0)
-    # экспоненциальный штраф за возраст — утренним постам важна свежесть
-    score -= int(age ** 1.1)
+    score -= int(age ** 1.1)  # экспоненциальный штраф по возрасту
     return score
 
 def get_feed_news(feeds: list[str], max_news: int) -> list[dict]:
@@ -182,10 +183,8 @@ def get_feed_news(feeds: list[str], max_news: int) -> list[dict]:
                     continue
                 published_dt = datetime(*st[:6], tzinfo=timezone.utc)
                 age_hours = (now - published_dt).total_seconds() / 3600.0
-                # Жёстко отсекаем старше утреннего окна
                 if age_hours > FRESHNESS_HOURS_MORNING:
                     continue
-
                 title = _unescape_then_escape(_strip_tags(entry.get("title") or ""))
                 summary = _unescape_then_escape(_strip_tags(entry.get("summary") or ""))
                 link = (entry.get("link") or "").strip()
@@ -193,7 +192,6 @@ def get_feed_news(feeds: list[str], max_news: int) -> list[dict]:
                     continue
                 if not is_quality_news(title, summary):
                     continue
-
                 item = {
                     "title": title,
                     "title_norm": _norm_title(title),
@@ -225,17 +223,36 @@ def get_feed_news(feeds: list[str], max_news: int) -> list[dict]:
             continue
         filtered.append(e)
 
-    # скоринг + сортировка: score desc, при равенстве — свежее выше
+    # скоринг + сортировка
     for n in filtered:
         n["score"] = score_item(n)
     filtered.sort(key=lambda x: (x["score"], -x["published_dt"].timestamp()), reverse=True)
 
-    # берём запас (×2), потом урежем до max_news
-    return filtered[: max_news * 2]
+    # баланс крипто/фин
+    def is_crypto_item(it: dict) -> bool:
+        t = (it.get("title","") + " " + it.get("summary","")).lower()
+        return bool(re.search(r"\b(bitcoin|btc|ethereum|eth|crypto)\b", t))
+
+    crypto_items = [n for n in filtered if is_crypto_item(n)]
+    fin_items = [n for n in filtered if not is_crypto_item(n)]
+
+    max_crypto = max(1, int(NEWS_COUNT * CRYPTO_RATIO))
+    balanced = crypto_items[:max_crypto] + fin_items
+    balanced.sort(key=lambda x: (x["score"], -x["published_dt"].timestamp()), reverse=True)
+
+    return balanced[: max_news * 2]
 
 def filter_by_importance(news_list: list[dict], take: int) -> list[dict]:
-    # у нас уже есть score; просто доберём финальный список с балансом
-    return news_list[:take]
+    # гарантируем минимум финновостей
+    def is_crypto_item(it: dict) -> bool:
+        t = (it.get("title","") + " " + it.get("summary","")).lower()
+        return bool(re.search(r"\b(bitcoin|btc|ethereum|eth|crypto)\b", t))
+    crypto = [n for n in news_list if is_crypto_item(n)]
+    fin = [n for n in news_list if not is_crypto_item(n)]
+    out = fin[:MIN_FIN_NEWS] + crypto
+    if len(out) < take:
+        out += [n for n in fin[MIN_FIN_NEWS:]]  # добираем финновостями
+    return out[:take]
 
 # ===== MARKET DATA =====
 def validate_market_data(data_type, current_value, change_percent) -> bool:
@@ -258,6 +275,28 @@ def validate_market_data(data_type, current_value, change_percent) -> bool:
         return False
     return True
 
+def _pair_last_close(df):
+    # вчерашний close vs позавчерашний — идеально для утреннего поста
+    if df.empty or len(df) < 2:
+        return None
+    cur = float(df["Close"].iloc[-1])
+    prev = float(df["Close"].iloc[-2])
+    chg = (cur - prev) / prev * 100
+    return cur, chg
+
+def _pair_intraday(df):
+    # последний Close vs предыдущий Close (если нужен более «онлайновый» вид)
+    if df.empty:
+        return None
+    if len(df) >= 2:
+        cur = float(df["Close"].iloc[-1])
+        prev = float(df["Close"].iloc[-2])
+    else:
+        cur = float(df["Close"].iloc[-1])
+        prev = cur
+    chg = (cur - prev) / prev * 100 if prev else 0.0
+    return cur, chg
+
 async def get_market_data():
     try:
         print("📊 Получаем рыночные данные...")
@@ -269,14 +308,7 @@ async def get_market_data():
         tnx = yf.download("^TNX", period="2d", interval="1d", auto_adjust=False)
 
         market_data = {}
-
-        def _pair(df):
-            if df.empty or len(df) < 2:
-                return None
-            cur = float(df["Close"].iloc[-1])
-            prev = float(df["Close"].iloc[-2])
-            chg = (cur - prev) / prev * 100
-            return cur, chg
+        _pair = _pair_last_close if MARKET_SOURCE_MODE == "last_close" else _pair_intraday
 
         sp = _pair(sp500)
         if sp and validate_market_data("sp500", sp[0], sp[1]):
@@ -302,7 +334,6 @@ async def get_market_data():
         if tn and validate_market_data("treasury", tn[0], tn[1]):
             market_data["treasury"] = tn
 
-        # лог-вывод
         for k, (v, c) in market_data.items():
             unit = "$" if k in ("sp500", "nasdaq", "gold", "oil") else ""
             print(f"✅ {k.upper()}: {unit}{v:.2f} ({c:+.2f}%)")
@@ -357,7 +388,6 @@ async def get_morning_image() -> BytesIO | None:
         img_url = resp.data[0].url
         buf = BytesIO(requests.get(img_url, timeout=20).content)
 
-        # уменьшаем ТОЛЬКО ВЫСОТУ (ширину не трогаем)
         resized = resize_image_height(buf, target_height=TARGET_IMAGE_HEIGHT)
 
         if save_static_image(resized):
@@ -369,6 +399,121 @@ async def get_morning_image() -> BytesIO | None:
     except Exception as e:
         print(f"❌ Ошибка генерации изображения: {e}")
         return None
+
+# ===== DIGEST BUILD HELPERS (пост-обработка стиля) =====
+def sanitize_markdown(text: str) -> str:
+    """Убираем **жирный**, __подчёркивание__ и прочий markdown/лишние пробелы."""
+    if not text:
+        return ""
+    out = re.sub(r"\*\*(.*?)\*\*", r"\1", text)      # **bold**
+    out = re.sub(r"__(.*?)__", r"\1", out)           # __underline__
+    out = re.sub(r"_([^_]+)_", r"\1", out)           # _italic_
+    out = re.sub(r"`([^`]+)`", r"\1", out)           # `code`
+    out = re.sub(r"\s+\n", "\n", out)
+    return out.strip()
+
+def decorate_digest_with_emojis(digest: str) -> str:
+    """Эмодзи для пунктов 1–7, если их нет."""
+    if not digest:
+        return ""
+    mapping = {
+        "1️⃣": "📊",  # Глобальные рынки (но 1️⃣ мы перезапишем mood-лайном)
+        "2️⃣": "📈",
+        "3️⃣": "🏦",
+        "4️⃣": "🧭",
+        "5️⃣": "🏢",
+        "6️⃣": "🚀",
+        "7️⃣": "🌍",
+    }
+    lines = digest.splitlines()
+    out = []
+    for line in lines:
+        m = re.match(r"^([1-7]️⃣)\s*(.*)$", line.strip())
+        if m:
+            num, rest = m.groups()
+            if ":" in rest:
+                head, tail = rest.split(":", 1)
+                tail = tail.strip()
+                if not tail.startswith(tuple(mapping.values())):
+                    tail = f"{mapping.get(num, '')} {tail}".strip()
+                out.append(f"{num} {head.strip()}: {tail}")
+            else:
+                out.append(f"{num} {mapping.get(num,'')} {rest}".strip())
+        else:
+            out.append(line)
+    return "\n".join(out).strip()
+
+def rebuild_lines_with_market_data(digest: str, market_data: dict | None) -> str:
+    """Гарантируем точность в пунктах 2 и 3 — строим их из реальных данных."""
+    if not market_data or not digest:
+        return digest
+
+    def val(name, fmt_val):
+        if name not in market_data:
+            return None
+        v, c = market_data[name]
+        return fmt_val(v) + f"({c:+.1f}%)"
+
+    sp = val("sp500", lambda v: f"S&P500 ${v:.0f}")
+    nd = val("nasdaq", lambda v: f"Nasdaq ${v:.0f}")
+    au = val("gold",  lambda v: f"Золото ${v:.0f}")
+    oi = val("oil",   lambda v: f"Нефть ${v:.0f}")
+    dx = val("dxy",   lambda v: f"DXY {v:.1f}")
+    tn = val("treasury", lambda v: f"10Y {v:.1f}%")
+
+    line2_parts = [p for p in (sp, nd, oi) if p]
+    line3_parts = [p for p in (tn, dx, au, oi) if p]
+
+    lines = digest.splitlines()
+    new_lines = []
+    for line in lines:
+        if line.startswith("2️⃣"):
+            txt = " · ".join(line2_parts) if line2_parts else ""
+            new_lines.append(f"2️⃣ Итоги торгов: {txt}".strip())
+        elif line.startswith("3️⃣"):
+            txt = " · ".join(line3_parts) if line3_parts else ""
+            new_lines.append(f"3️⃣ Трежерис, DXY, золото, нефть: {txt}".strip())
+        else:
+            new_lines.append(line)
+    return "\n".join(new_lines).strip()
+
+def build_global_mood_line(market_data: dict | None) -> str:
+    """
+    Делает качественную строку '1️⃣ Глобальные рынки: <эмодзи> ...'
+    Логика:
+      - считаем вклад S&P500 и Nasdaq (плюс), DXY и 10Y (минус для риска);
+      - подбираем эмодзи и короткую фразу.
+    """
+    if not market_data:
+        return "1️⃣ Глобальные рынки: ➖ Нейтральный фон, явного драйвера нет."
+
+    up = 0.0
+    down = 0.0
+
+    def _add(name, weight=1.0, invert=False):
+        nonlocal up, down
+        if name in market_data:
+            _, chg = market_data[name]
+            chg = -chg if invert else chg
+            if chg >= 0.05:
+                up += weight * chg
+            elif chg <= -0.05:
+                down += weight * abs(chg)
+
+    # индексы — позитив, DXY/10Y — негатив для риска
+    _add("sp500", 1.0)
+    _add("nasdaq", 1.0)
+    _add("dxy", 0.7, invert=True)
+    _add("treasury", 0.7, invert=True)
+
+    score = up - down
+    if score > 0.3:
+        emoji, phrase = "📈", "Позитивный тон на ожиданиях спроса на риск."
+    elif score < -0.3:
+        emoji, phrase = "📉", "Негативный фон из-за сильного доллара и доходностей."
+    else:
+        emoji, phrase = "➖", "Нейтральный рынок без явного тренда."
+    return f"1️⃣ Глобальные рынки: {emoji} {phrase}"
 
 # ===== LLM DIGEST (compact) =====
 async def ai_format_morning_digest_compact_final(news_list, market_data, crypto_data):
@@ -389,23 +534,21 @@ async def ai_format_morning_digest_compact_final(news_list, market_data, crypto_
         if "treasury" in market_data:
             v, c = market_data["treasury"]; real_data += f"10Y {v:.1f}%({c:+.1f}%)"
 
-    # берём только заголовки (без ссылок/тел) — чтобы не было «вымышленной» инфы
     news_titles = "\n".join([f"- {n['title']}" for n in news_list[:7]])
 
     prompt = f"""
 Сформируй КРАТКУЮ утреннюю сводку на русском (МАКС 900 символов).
-Структура из 7 пунктов с эмодзи:
+Структура: 7 пунктов, каждый с номером 1️⃣..7️⃣ и коротким названием (без **жирного**).
 
-1️⃣ Глобальные рынки (≤140) — используй: {real_data}
-2️⃣ Итоги торгов (≤120) — используй: {real_data}
-3️⃣ Трежерис, DXY, золото, нефть (≤120) — используй: {real_data}
-4️⃣ Монетарная политика (≤120) — используй: {real_data}
-5️⃣ Корпоративные новости (≤120) — используй: {real_data}
-6️⃣ Криптовалюты (≤160) — используй: {real_data}
-7️⃣ Геополитика (≤120) — используй: {real_data}
+1️⃣ Глобальные рынки (≤140) — качественная оценка настроения (без цифр).
+2️⃣ Итоги торгов (≤120) — используй ТОЛЬКО: {real_data}
+3️⃣ Трежерис, DXY, золото, нефть (≤120) — используй ТОЛЬКО: {real_data}
+4️⃣ Монетарная политика (≤120)
+5️⃣ Корпоративные новости (≤120)
+6️⃣ Криптовалюты (≤160)
+7️⃣ Геополитика (≤120)
 
-⚠️ КРАТКО. Только факты из списка новостей и {real_data}.
-⚠️ НЕ придумывай цифры. Если данных нет — пропусти.
+⚠️ КРАТКО. Только факты из списка новостей и {real_data}. НЕ используй **жирный**.
 
 Новости:
 {news_titles}
@@ -414,7 +557,7 @@ async def ai_format_morning_digest_compact_final(news_list, market_data, crypto_
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "Ты — финансовый редактор. Пиши очень кратко и фактологично."},
+            {"role": "system", "content": "Ты — финансовый редактор. Очень кратко, фактологично, без markdown-форматирования."},
             {"role": "user", "content": prompt},
         ],
         max_tokens=400,
@@ -433,7 +576,6 @@ async def send_morning_digest():
         print("⚠️ Нет свежих новостей в окне актуальности")
         return
 
-    # финальный список
     news_list = filter_by_importance(pool, NEWS_COUNT)
     print(f"✅ Отобрано {len(news_list)} актуальных новостей (≤ {FRESHNESS_HOURS_MORNING}ч)")
 
@@ -441,35 +583,52 @@ async def send_morning_digest():
     market_data = await get_market_data()
     crypto_data = await get_crypto_data()
 
-    # 3) текст сводки
+    # 3) текст сводки (черновик от LLM)
     print("🤖 Формируем компактную сводку…")
-    digest = await ai_format_morning_digest_compact_final(news_list, market_data, crypto_data)
+    digest_raw = await ai_format_morning_digest_compact_final(news_list, market_data, crypto_data)
+
+    # === ПОСТ-ОБРАБОТКА СТИЛЯ ===
+    digest = sanitize_markdown(digest_raw)                          # убираем ** и пр.
+    digest = rebuild_lines_with_market_data(digest, market_data)    # 2 и 3 строго из market_data
+    digest = decorate_digest_with_emojis(digest)                    # эмодзи под каждый пункт
+
+    # --- перезаписываем пункт 1️⃣ на «качественный» mood-лайн
+    mood_line = build_global_mood_line(market_data)
+    lines = digest.splitlines()
+    new_lines = []
+    replaced = False
+    for line in lines:
+        if (not replaced) and line.strip().startswith("1️⃣"):
+            new_lines.append(mood_line)
+            replaced = True
+        else:
+            new_lines.append(line)
+    digest = "\n".join(new_lines).strip()
 
     # 4) шапка с датой в Europe/Vienna
     now_local = datetime.now(LOCAL_TZ)
     header = f"🌅 Утренняя сводка — {now_local:%d.%m.%Y}"
 
-    # 5) крипто-блок (компактно)
+    # 5) крипто-блок — многострочный, как просил
     crypto_section = ""
     if crypto_data:
-        parts = []
+        lines = ["💎 Криптовалюты (ТОП-5)"]
         if "bitcoin" in crypto_data:
             p = crypto_data["bitcoin"]["usd"]; c = crypto_data["bitcoin"]["usd_24h_change"]
-            parts.append(f"BTC ${p:,.0f}({c:+.1f}%)")
+            lines.append(f"BTC ${p:,.0f}({c:+.1f}%)")
         if "ethereum" in crypto_data:
             p = crypto_data["ethereum"]["usd"]; c = crypto_data["ethereum"]["usd_24h_change"]
-            parts.append(f"ETH ${p:,.0f}({c:+.1f}%)")
+            lines.append(f"ETH ${p:,.0f}({c:+.1f}%)")
         if "binancecoin" in crypto_data:
             p = crypto_data["binancecoin"]["usd"]; c = crypto_data["binancecoin"]["usd_24h_change"]
-            parts.append(f"BNB ${p:.0f}({c:+.1f}%)")
+            lines.append(f"BNB ${p:.0f}({c:+.1f}%)")
         if "ripple" in crypto_data:
             p = crypto_data["ripple"]["usd"]; c = crypto_data["ripple"]["usd_24h_change"]
-            parts.append(f"XRP ${p:.2f}({c:+.1f}%)")
+            lines.append(f"XRP ${p:.2f}({c:+.1f}%)")
         if "solana" in crypto_data:
             p = crypto_data["solana"]["usd"]; c = crypto_data["solana"]["usd_24h_change"]
-            parts.append(f"SOL ${p:.0f}({c:+.1f}%)")
-        if parts:
-            crypto_section = "\n\n💎 " + " · ".join(parts)
+            lines.append(f"SOL ${p:.0f}({c:+.1f}%)")
+        crypto_section = "\n\n" + "\n".join(lines)
 
     # 6) собрать пост и уложить в лимит подписи к фото (1024)
     full_post = f"{header}\n\n{digest}{crypto_section}\n\n{SIGNATURE}"
@@ -496,7 +655,7 @@ async def send_morning_digest():
                 chat_id=TELEGRAM_CHANNEL_RU,
                 photo=image,
                 caption=full_post,
-                parse_mode=None,
+                parse_mode=None,   # чистый текст
             )
             print("✅ Пост с изображением отправлен!")
         else:
@@ -516,6 +675,7 @@ async def send_morning_digest():
     print(f"• Рыночные данные: {'✅' if market_data else '❌'}")
     print(f"• Крипто-данные: {'✅' if crypto_data else '❌'}")
     print(f"• Окно свежести: {FRESHNESS_HOURS_MORNING} ч")
+    print(f"• Источник рынков: {MARKET_SOURCE_MODE}")
     print(f"• Картинка: {'✅' if image else '❌'}")
 
 if __name__ == "__main__":
