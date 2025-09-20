@@ -19,10 +19,14 @@ import yfinance as yf
 from pycoingecko import CoinGeckoAPI
 from PIL import Image  # Pillow для автосжатия
 
-# ===== CONFIG =====
+# ================== CONFIG ==================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHANNEL_RU = "-1002597393191"
+TELEGRAM_CHANNEL_RU = os.getenv("TELEGRAM_CHANNEL_RU", "-1002597393191")
+
+# В проде включи переменной окружения SEND_TO_TELEGRAM=1
+SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "0") == "1"   # 0 = только консоль, 1 = слать в TG
+MAX_CAPTION = 1024  # лимит подписи к фото в Telegram
 
 NEWS_COUNT = 15
 SIGNATURE = "С вами был ReserveOne ☕️"
@@ -40,7 +44,7 @@ os.makedirs(IMAGES_DIR, exist_ok=True)
 STATIC_IMAGE_PATH = os.path.join(IMAGES_DIR, "morning_digest_static.png")
 TARGET_IMAGE_HEIGHT = int(os.getenv("TARGET_IMAGE_HEIGHT", "750"))
 
-# Баланс крипто/финансов (при желании — отрегулировать через env)
+# Баланс крипто/финансов (регулируется через env)
 CRYPTO_RATIO = float(os.getenv("CRYPTO_RATIO", "0.4"))          # целевая доля крипто в пуле
 MIN_FIN_NEWS = int(os.getenv("MIN_FIN_NEWS", "6"))              # минимум финновостей
 CRYPTO_KEYWORD_BONUS = int(os.getenv("CRYPTO_KEYWORD_BONUS", "50"))
@@ -63,7 +67,7 @@ FINANCE_FEEDS = [
     "https://www.morningbrew.com/feed.xml",
 ]
 
-# ===== IMAGE UTILS =====
+# ================== IMAGE UTILS ==================
 def static_image_exists() -> bool:
     try:
         return os.path.exists(STATIC_IMAGE_PATH) and os.path.getsize(STATIC_IMAGE_PATH) > 1024
@@ -98,6 +102,9 @@ def load_static_image() -> BytesIO | None:
     return None
 
 def resize_image_height(image_bytes: BytesIO, target_height: int = 750) -> BytesIO:
+    """
+    Уменьшает только высоту до target_height, ширину оставляет как есть (например, 1024x1024 → 1024x750).
+    """
     try:
         img = Image.open(image_bytes)
         w, h = img.size
@@ -114,7 +121,7 @@ def resize_image_height(image_bytes: BytesIO, target_height: int = 750) -> Bytes
         image_bytes.seek(0)
         return image_bytes
 
-# ===== NEWS FRESHNESS/SCORING =====
+# ================== NEWS FRESHNESS/SCORING ==================
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -254,7 +261,7 @@ def filter_by_importance(news_list: list[dict], take: int) -> list[dict]:
         out += [n for n in fin[MIN_FIN_NEWS:]]  # добираем финновостями
     return out[:take]
 
-# ===== MARKET DATA =====
+# ================== MARKET DATA ==================
 def validate_market_data(data_type, current_value, change_percent) -> bool:
     rules = {
         "sp500": {"min": 2000, "max": 8000, "change_max": 10},
@@ -310,29 +317,17 @@ async def get_market_data():
         market_data = {}
         _pair = _pair_last_close if MARKET_SOURCE_MODE == "last_close" else _pair_intraday
 
-        sp = _pair(sp500)
-        if sp and validate_market_data("sp500", sp[0], sp[1]):
-            market_data["sp500"] = sp
+        def _put(name, df):
+            pair = _pair(df)
+            if pair and validate_market_data(name, pair[0], pair[1]):
+                market_data[name] = pair
 
-        ndq = _pair(nasdaq)
-        if ndq and validate_market_data("nasdaq", ndq[0], ndq[1]):
-            market_data["nasdaq"] = ndq
-
-        dx = _pair(dxy)
-        if dx and validate_market_data("dxy", dx[0], dx[1]):
-            market_data["dxy"] = dx
-
-        au = _pair(gold)
-        if au and validate_market_data("gold", au[0], au[1]):
-            market_data["gold"] = au
-
-        br = _pair(oil)
-        if br and validate_market_data("oil", br[0], br[1]):
-            market_data["oil"] = br
-
-        tn = _pair(tnx)
-        if tn and validate_market_data("treasury", tn[0], tn[1]):
-            market_data["treasury"] = tn
+        _put("sp500", sp500)
+        _put("nasdaq", nasdaq)
+        _put("dxy", dxy)
+        _put("gold", gold)
+        _put("oil", oil)
+        _put("treasury", tnx)
 
         for k, (v, c) in market_data.items():
             unit = "$" if k in ("sp500", "nasdaq", "gold", "oil") else ""
@@ -362,8 +357,12 @@ async def get_crypto_data():
         print(f"❌ Error fetching crypto data: {e}")
         return None
 
-# ===== IMAGE GEN (1024x1024 → уменьшение высоты) =====
+# ================== IMAGE GEN (1024x1024 → уменьшение высоты) ==================
 async def get_morning_image() -> BytesIO | None:
+    if not SEND_TO_TELEGRAM:
+        print("🖼️ Генерация изображения пропущена (SEND_TO_TELEGRAM=0).")
+        return None
+
     if static_image_exists():
         print("✅ Используем сохранённое статичное изображение")
         cached = load_static_image()
@@ -400,7 +399,7 @@ async def get_morning_image() -> BytesIO | None:
         print(f"❌ Ошибка генерации изображения: {e}")
         return None
 
-# ===== DIGEST BUILD HELPERS (пост-обработка стиля) =====
+# ================== DIGEST BUILD HELPERS (пост-обработка) ==================
 def sanitize_markdown(text: str) -> str:
     """Убираем **жирный**, __подчёркивание__ и прочий markdown/лишние пробелы."""
     if not text:
@@ -412,61 +411,95 @@ def sanitize_markdown(text: str) -> str:
     out = re.sub(r"\s+\n", "\n", out)
     return out.strip()
 
+SECTION_ORDER = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣"]
+SECTION_EMOJI = {"1️⃣":"📊","2️⃣":"📈","3️⃣":"🏦","4️⃣":"🧭","5️⃣":"🏢","6️⃣":"🚀","7️⃣":"🌍"}
+
+def enforce_seven_compact_lines(draft: str) -> str:
+    """
+    Берём максимум по одной строке на каждый пункт 1..7.
+    Игнорируем любые строки, не начинающиеся с номера секции.
+    Режем вторые предложения (после первой точки).
+    """
+    seen = set()
+    picked = []
+    for raw in (l.strip() for l in draft.splitlines()):
+        if not raw:
+            continue
+        m = re.match(r"^([1-7]️⃣)\s*(.+)$", raw)
+        if not m:
+            continue
+        tag, rest = m.groups()
+        if tag in seen:
+            continue
+        one = re.split(r"(?<=\.)\s", rest, maxsplit=1)[0].strip()
+        if ":" not in one:
+            name = {
+                "1️⃣":"Глобальные рынки",
+                "2️⃣":"Итоги торгов",
+                "3️⃣":"Трежерис, DXY, золото, нефть",
+                "4️⃣":"Монетарная политика",
+                "5️⃣":"Корпоративные новости",
+                "6️⃣":"Криптовалюты",
+                "7️⃣":"Геополитика",
+            }[tag]
+            one = f"{name}: {one}"
+        picked.append(f"{tag} {one}")
+        seen.add(tag)
+        if len(picked) == 7:
+            break
+    picked.sort(key=lambda s: SECTION_ORDER.index(s[:2]) if s[:2] in SECTION_ORDER else 99)
+    return "\n\n".join(picked)
+
 def decorate_digest_with_emojis(digest: str) -> str:
     """Эмодзи для пунктов 1–7, если их нет."""
     if not digest:
         return ""
-    mapping = {
-        "1️⃣": "📊",  # Глобальные рынки (но 1️⃣ мы перезапишем mood-лайном)
-        "2️⃣": "📈",
-        "3️⃣": "🏦",
-        "4️⃣": "🧭",
-        "5️⃣": "🏢",
-        "6️⃣": "🚀",
-        "7️⃣": "🌍",
-    }
-    lines = digest.splitlines()
-    out = []
-    for line in lines:
+    lines = []
+    for line in digest.splitlines():
         m = re.match(r"^([1-7]️⃣)\s*(.*)$", line.strip())
-        if m:
-            num, rest = m.groups()
-            if ":" in rest:
-                head, tail = rest.split(":", 1)
-                tail = tail.strip()
-                if not tail.startswith(tuple(mapping.values())):
-                    tail = f"{mapping.get(num, '')} {tail}".strip()
-                out.append(f"{num} {head.strip()}: {tail}")
-            else:
-                out.append(f"{num} {mapping.get(num,'')} {rest}".strip())
+        if not m:
+            continue
+        tag, rest = m.groups()
+        if ":" in rest:
+            head, tail = rest.split(":", 1)
+            tail = tail.strip()
+            if not tail.startswith(SECTION_EMOJI.get(tag, "")):
+                tail = f"{SECTION_EMOJI.get(tag, '')} {tail}".strip()
+            lines.append(f"{tag} {head.strip()}: {tail}")
         else:
-            out.append(line)
-    return "\n".join(out).strip()
+            lines.append(f"{tag} {SECTION_EMOJI.get(tag,'')} {rest}".strip())
+    return "\n\n".join(lines).strip()
 
 def rebuild_lines_with_market_data(digest: str, market_data: dict | None) -> str:
     """Гарантируем точность в пунктах 2 и 3 — строим их из реальных данных."""
     if not market_data or not digest:
         return digest
 
-    def val(name, fmt_val):
+    def _safe_val(name, fmt_val):
         if name not in market_data:
             return None
         v, c = market_data[name]
+        ranges = {
+            "sp500": (2000, 8000), "nasdaq": (5000, 25000),
+            "dxy": (80, 120), "gold": (1000, 3000), "oil": (20, 150), "treasury": (0, 10)
+        }
+        lo, hi = ranges.get(name, (-1e9, 1e9))
+        if not (lo <= v <= hi):
+            return None
         return fmt_val(v) + f"({c:+.1f}%)"
 
-    sp = val("sp500", lambda v: f"S&P500 ${v:.0f}")
-    nd = val("nasdaq", lambda v: f"Nasdaq ${v:.0f}")
-    au = val("gold",  lambda v: f"Золото ${v:.0f}")
-    oi = val("oil",   lambda v: f"Нефть ${v:.0f}")
-    dx = val("dxy",   lambda v: f"DXY {v:.1f}")
-    tn = val("treasury", lambda v: f"10Y {v:.1f}%")
+    sp = _safe_val("sp500", lambda v: f"S&P500 ${v:.0f}")
+    nd = _safe_val("nasdaq", lambda v: f"Nasdaq ${v:.0f}")
+    au = _safe_val("gold",  lambda v: f"Золото ${v:.0f}")
+    oi = _safe_val("oil",   lambda v: f"Нефть ${v:.0f}")
+    dx = _safe_val("dxy",   lambda v: f"DXY {v:.1f}")
+    tn = _safe_val("treasury", lambda v: f"10Y {v:.1f}%")
 
     line2_parts = [p for p in (sp, nd, oi) if p]
     line3_parts = [p for p in (tn, dx, au, oi) if p]
 
-    lines = digest.splitlines()
     new_lines = []
-    for line in lines:
+    for line in digest.splitlines():
         if line.startswith("2️⃣"):
             txt = " · ".join(line2_parts) if line2_parts else ""
             new_lines.append(f"2️⃣ Итоги торгов: {txt}".strip())
@@ -475,14 +508,12 @@ def rebuild_lines_with_market_data(digest: str, market_data: dict | None) -> str
             new_lines.append(f"3️⃣ Трежерис, DXY, золото, нефть: {txt}".strip())
         else:
             new_lines.append(line)
-    return "\n".join(new_lines).strip()
+    return "\n\n".join(new_lines).strip()
 
 def build_global_mood_line(market_data: dict | None) -> str:
     """
     Делает качественную строку '1️⃣ Глобальные рынки: <эмодзи> ...'
-    Логика:
-      - считаем вклад S&P500 и Nasdaq (плюс), DXY и 10Y (минус для риска);
-      - подбираем эмодзи и короткую фразу.
+    S&P500/Nasdaq — позитив, DXY/10Y — негатив для риска.
     """
     if not market_data:
         return "1️⃣ Глобальные рынки: ➖ Нейтральный фон, явного драйвера нет."
@@ -500,7 +531,6 @@ def build_global_mood_line(market_data: dict | None) -> str:
             elif chg <= -0.05:
                 down += weight * abs(chg)
 
-    # индексы — позитив, DXY/10Y — негатив для риска
     _add("sp500", 1.0)
     _add("nasdaq", 1.0)
     _add("dxy", 0.7, invert=True)
@@ -515,8 +545,57 @@ def build_global_mood_line(market_data: dict | None) -> str:
         emoji, phrase = "➖", "Нейтральный рынок без явного тренда."
     return f"1️⃣ Глобальные рынки: {emoji} {phrase}"
 
-# ===== LLM DIGEST (compact) =====
+def normalize_sections_spacing(text: str) -> str:
+    """Пустая строка между пунктами, аккуратные двоеточия."""
+    fixed = []
+    for line in text.splitlines():
+        line = re.sub(r"\s*:\s*", ": ", line, count=1)
+        fixed.append(line.strip())
+    return "\n\n".join([l for l in fixed if l])
+
+def enforce_len_budget(header: str, body: str, tail: str, max_len: int) -> str:
+    """
+    Сначала мягко укорачиваем самые длинные строки (≈180→≈160→≈100),
+    потом — если всё ещё длинно — убираем наименее критичные разделы: 7️⃣→6️⃣→5️⃣→4️⃣.
+    """
+    parts = body.split("\n\n")
+
+    def total_len(h, items, t):
+        return len(h) + 2 + len("\n\n".join(items)) + 2 + len(t)
+
+    # мягкая усадка
+    trimmed = []
+    for s in parts:
+        if len(s) > 180:
+            cut = s[:175]
+            last = max(cut.rfind(")"), cut.rfind("%"), cut.rfind(" "), cut.rfind("·"))
+            s = (cut[:last].rstrip() if last > 120 else cut.rstrip()) + "…"
+        elif len(s) > 160:
+            s = s[:160].rstrip() + "…"
+        trimmed.append(s)
+    parts = trimmed
+
+    # при необходимости — удаляем по приоритету для CEO
+    drop_order = ["7️⃣","6️⃣","5️⃣","4️⃣"]
+    while total_len(header, parts, tail) > max_len and parts:
+        idx = max(range(len(parts)), key=lambda i: len(parts[i]))
+        if len(parts[idx]) > 100:
+            parts[idx] = parts[idx][:100].rstrip() + "…"
+        if total_len(header, parts, tail) > max_len:
+            found = next((i for i, s in enumerate(parts) if s[:2] in drop_order), None)
+            if found is not None:
+                parts.pop(found)
+            else:
+                parts.pop()
+
+    return f"{header}\n\n" + "\n\n".join(parts) + f"\n\n{tail}"
+
+# ================== LLM DIGEST (черновик для 7 строк) ==================
 async def ai_format_morning_digest_compact_final(news_list, market_data, crypto_data):
+    """
+    Генерируем «черновик» на одну строку для каждого пункта 1..7, без markdown.
+    Потом перезапишем 1/2/3 цифрами и проставим эмодзи.
+    """
     client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
 
     real_data = ""
@@ -534,38 +613,38 @@ async def ai_format_morning_digest_compact_final(news_list, market_data, crypto_
         if "treasury" in market_data:
             v, c = market_data["treasury"]; real_data += f"10Y {v:.1f}%({c:+.1f}%)"
 
-    news_titles = "\n".join([f"- {n['title']}" for n in news_list[:7]])
+    news_titles = "\n".join([f"- {n['title']}" for n in news_list[:8]])
 
     prompt = f"""
-Сформируй КРАТКУЮ утреннюю сводку на русском (МАКС 900 символов).
-Структура: 7 пунктов, каждый с номером 1️⃣..7️⃣ и коротким названием (без **жирного**).
+Сделай компактный «CEO morning brief» на русском (до 900 символов всего).
+Строго 7 строк, каждая начинается с номера 1️⃣..7️⃣ и БЕЗ доп.строк:
+1️⃣ Глобальные рынки — качественно (без цифр).
+2️⃣ Итоги торгов — ТОЛЬКО из набора: {real_data}
+3️⃣ Трежерис/DXY/золото/нефть — ТОЛЬКО из набора: {real_data}
+4️⃣ Монетарная политика — одно короткое наблюдение.
+5️⃣ Корпоративные новости — один факт (крупные эмитенты/IPO/M&A/гайд).
+6️⃣ Криптовалюты — один факт (регуляторы/ликвидность/институции).
+7️⃣ Геополитика — один факт с рыночной релевантностью.
 
-1️⃣ Глобальные рынки (≤140) — качественная оценка настроения (без цифр).
-2️⃣ Итоги торгов (≤120) — используй ТОЛЬКО: {real_data}
-3️⃣ Трежерис, DXY, золото, нефть (≤120) — используй ТОЛЬКО: {real_data}
-4️⃣ Монетарная политика (≤120)
-5️⃣ Корпоративные новости (≤120)
-6️⃣ Криптовалюты (≤160)
-7️⃣ Геополитика (≤120)
+Тон: Bloomberg/NYT/Reuters. Без markdown, без жирного, без эмодзи.
+Одна строка на пункт. Без вторых предложений.
 
-⚠️ КРАТКО. Только факты из списка новостей и {real_data}. НЕ используй **жирный**.
-
-Новости:
+Факт-база (используй только это):
 {news_titles}
 """
 
     resp = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": "Ты — финансовый редактор. Очень кратко, фактологично, без markdown-форматирования."},
+            {"role": "system", "content": "Ты — финансовый редактор для CEO. Строго, кратко, фактологично."},
             {"role": "user", "content": prompt},
         ],
-        max_tokens=400,
+        max_tokens=420,
         temperature=0.2,
     )
     return (resp.choices[0].message.content or "").strip()
 
-# ===== MAIN SEND =====
+# ================== MAIN ==================
 async def send_morning_digest():
     print("🚀 Запуск утренней сводки...")
 
@@ -588,87 +667,76 @@ async def send_morning_digest():
     digest_raw = await ai_format_morning_digest_compact_final(news_list, market_data, crypto_data)
 
     # === ПОСТ-ОБРАБОТКА СТИЛЯ ===
-    digest = sanitize_markdown(digest_raw)                          # убираем ** и пр.
-    digest = rebuild_lines_with_market_data(digest, market_data)    # 2 и 3 строго из market_data
-    digest = decorate_digest_with_emojis(digest)                    # эмодзи под каждый пункт
+    digest = sanitize_markdown(digest_raw)                      # убираем ** и пр.
+    digest = enforce_seven_compact_lines(digest)                # строго 7 строк / 1 на пункт
+    digest = rebuild_lines_with_market_data(digest, market_data)# 2 и 3 строго из market_data
+    digest = decorate_digest_with_emojis(digest)                # эмодзи под каждый пункт
 
-    # --- перезаписываем пункт 1️⃣ на «качественный» mood-лайн
+    # mood-line для 1️⃣
     mood_line = build_global_mood_line(market_data)
-    lines = digest.splitlines()
-    new_lines = []
-    replaced = False
-    for line in lines:
-        if (not replaced) and line.strip().startswith("1️⃣"):
-            new_lines.append(mood_line)
-            replaced = True
-        else:
-            new_lines.append(line)
-    digest = "\n".join(new_lines).strip()
+    lines = digest.split("\n\n")
+    if lines and lines[0].startswith("1️⃣"):
+        lines[0] = mood_line
+    digest = "\n\n".join(lines)
+    digest = normalize_sections_spacing(digest)
 
-    # 4) шапка с датой в Europe/Vienna
+    # 4) шапка/подпись
     now_local = datetime.now(LOCAL_TZ)
     header = f"🌅 Утренняя сводка — {now_local:%d.%m.%Y}"
+    tail = SIGNATURE
 
-    # 5) крипто-блок — многострочный, как просил
-    crypto_section = ""
+    # 5) крипто-блок — многострочный
+    body = digest
     if crypto_data:
-        lines = ["💎 Криптовалюты (ТОП-5)"]
+        crypto_lines = ["💎 Криптовалюты (ТОП-5)"]
         if "bitcoin" in crypto_data:
             p = crypto_data["bitcoin"]["usd"]; c = crypto_data["bitcoin"]["usd_24h_change"]
-            lines.append(f"BTC ${p:,.0f}({c:+.1f}%)")
+            crypto_lines.append(f"BTC ${p:,.0f}({c:+.1f}%)")
         if "ethereum" in crypto_data:
             p = crypto_data["ethereum"]["usd"]; c = crypto_data["ethereum"]["usd_24h_change"]
-            lines.append(f"ETH ${p:,.0f}({c:+.1f}%)")
+            crypto_lines.append(f"ETH ${p:,.0f}({c:+.1f}%)")
         if "binancecoin" in crypto_data:
             p = crypto_data["binancecoin"]["usd"]; c = crypto_data["binancecoin"]["usd_24h_change"]
-            lines.append(f"BNB ${p:.0f}({c:+.1f}%)")
+            crypto_lines.append(f"BNB ${p:.0f}({c:+.1f}%)")
         if "ripple" in crypto_data:
             p = crypto_data["ripple"]["usd"]; c = crypto_data["ripple"]["usd_24h_change"]
-            lines.append(f"XRP ${p:.2f}({c:+.1f}%)")
+            crypto_lines.append(f"XRP ${p:.2f}({c:+.1f}%)")
         if "solana" in crypto_data:
             p = crypto_data["solana"]["usd"]; c = crypto_data["solana"]["usd_24h_change"]
-            lines.append(f"SOL ${p:.0f}({c:+.1f}%)")
-        crypto_section = "\n\n" + "\n".join(lines)
+            crypto_lines.append(f"SOL ${p:.0f}({c:+.1f}%)")
+        body = body + "\n\n" + "\n".join(crypto_lines)
 
-    # 6) собрать пост и уложить в лимит подписи к фото (1024)
-    full_post = f"{header}\n\n{digest}{crypto_section}\n\n{SIGNATURE}"
-    if len(full_post) > 1024:
-        # сначала уберём крипто-хвост
-        full_post = f"{header}\n\n{digest}\n\n{SIGNATURE}"
-        if len(full_post) > 1024:
-            excess = len(full_post) - 1021
-            digest_short = digest[:-excess].rstrip()
-            full_post = f"{header}\n\n{digest_short}…\n\n{SIGNATURE}"
-
+    # 6) жёсткий лимит и итоговый текст
+    full_post = enforce_len_budget(header, body, tail, MAX_CAPTION)
+    print(f"\n================= PREVIEW (console only) =================\n{full_post}\n==========================================================")
     print(f"🧮 Длина поста: {len(full_post)} символов")
 
-    # 7) получить/сжать картинку
-    print("🖼️ Готовим изображение…")
-    image = await get_morning_image()
+    # 7) отправка / консоль
+    if SEND_TO_TELEGRAM:
+        print("📤 Отправляем в Telegram…")
+        image = await get_morning_image()
+        try:
+            bot = Bot(token=TELEGRAM_TOKEN)
+            if image:
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHANNEL_RU,
+                    photo=image,
+                    caption=full_post,
+                    parse_mode=None,  # чистый текст
+                )
+            else:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHANNEL_RU,
+                    text=full_post,
+                    parse_mode=None,
+                )
+            print("✅ Пост отправлен в Telegram!")
+        except Exception as e:
+            print(f"❌ Ошибка отправки в Telegram: {e}")
+    else:
+        print("🧪 SEND_TO_TELEGRAM=0 — отправка в Telegram отключена, вывод только в консоль.")
 
-    # 8) отправка в Telegram
-    print("📤 Отправляем в Telegram…")
-    try:
-        bot = Bot(token=TELEGRAM_TOKEN)
-        if image:
-            await bot.send_photo(
-                chat_id=TELEGRAM_CHANNEL_RU,
-                photo=image,
-                caption=full_post,
-                parse_mode=None,   # чистый текст
-            )
-            print("✅ Пост с изображением отправлен!")
-        else:
-            await bot.send_message(
-                chat_id=TELEGRAM_CHANNEL_RU,
-                text=full_post,
-                parse_mode=None,
-            )
-            print("✅ Пост без изображения отправлен!")
-    except Exception as e:
-        print(f"❌ Ошибка отправки в Telegram: {e}")
-
-    # 9) статистика
+    # 8) краткая статистика
     print("\n📊 СТАТИСТИКА:")
     print(f"• Новостей: {len(news_list)}")
     print(f"• Символов: {len(full_post)}")
@@ -676,7 +744,7 @@ async def send_morning_digest():
     print(f"• Крипто-данные: {'✅' if crypto_data else '❌'}")
     print(f"• Окно свежести: {FRESHNESS_HOURS_MORNING} ч")
     print(f"• Источник рынков: {MARKET_SOURCE_MODE}")
-    print(f"• Картинка: {'✅' if image else '❌'}")
+    print(f"• Режим отправки: {'Telegram' if SEND_TO_TELEGRAM else 'Console'}")
 
 if __name__ == "__main__":
     asyncio.run(send_morning_digest())
