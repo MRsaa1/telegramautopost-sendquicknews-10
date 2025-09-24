@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 import yfinance as yf
 from pycoingecko import CoinGeckoAPI
 from PIL import Image  # Pillow для автосжатия
+import math
 
 # ================== CONFIG ==================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -25,7 +26,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_RU = os.getenv("TELEGRAM_CHANNEL_RU", "-1002597393191")
 
 # В проде включи переменной окружения SEND_TO_TELEGRAM=1
-SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "0") == "1"   # 0 = только консоль, 1 = слать в TG
+SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "1") == "1"   # 1 = слать в TG, 0 = только консоль
 MAX_CAPTION = 1024  # лимит подписи к фото в Telegram
 
 NEWS_COUNT = 15
@@ -33,10 +34,13 @@ SIGNATURE = "С вами был ReserveOne ☕️"
 
 # Таймзона и «утреннее окно свежести»
 LOCAL_TZ = ZoneInfo("Europe/Vienna")
-FRESHNESS_HOURS_MORNING = int(os.getenv("FRESHNESS_HOURS_MORNING", "18"))  # только последние 18ч
+FRESHNESS_HOURS_MORNING = int(os.getenv("FRESHNESS_HOURS_MORNING", "10"))  # только последние 10ч
 
 # Источник рыночных данных: "last_close" (вчера vs позавчера) или "intraday"
 MARKET_SOURCE_MODE = os.getenv("MARKET_SOURCE_MODE", "last_close")  # last_close | intraday
+
+# Доп. настройка: принудительно брать спот по золоту вместо фьючерса
+FORCE_GOLD_SPOT = os.getenv("FORCE_GOLD_SPOT", "0") == "1"
 
 # Изображение (кешируем и уменьшаем высоту)
 IMAGES_DIR = "images"
@@ -282,37 +286,73 @@ def validate_market_data(data_type, current_value, change_percent) -> bool:
         return False
     return True
 
-def _pair_last_close(df):
-    # вчерашний close vs позавчерашний — идеально для утреннего поста
-    if df.empty or len(df) < 2:
+def _safe_close_pair(df):
+    """Возвращает (cur, prev) как скаляры или None при NaN/пустоте."""
+    if df is None or df.empty:
         return None
-    cur = float(df["Close"].iloc[-1])
-    prev = float(df["Close"].iloc[-2])
-    chg = (cur - prev) / prev * 100
+    if "Close" not in df.columns:
+        return None
+    if len(df["Close"]) == 0:
+        return None
+    last = df["Close"].iloc[-1]
+    if last is None or math.isnan(float(last)):
+        return None
+    if len(df["Close"]) >= 2:
+        prev = df["Close"].iloc[-2]
+        if prev is None or math.isnan(float(prev)):
+            return None
+    else:
+        prev = last
+    return last.item(), prev.item()
+
+def _pair_last_close(df):
+    pair = _safe_close_pair(df)
+    if not pair:
+        return None
+    cur, prev = pair
+    chg = (cur - prev) / prev * 100 if prev else 0.0
     return cur, chg
 
 def _pair_intraday(df):
-    # последний Close vs предыдущий Close (если нужен более «онлайновый» вид)
-    if df.empty:
+    pair = _safe_close_pair(df)
+    if not pair:
         return None
-    if len(df) >= 2:
-        cur = float(df["Close"].iloc[-1])
-        prev = float(df["Close"].iloc[-2])
-    else:
-        cur = float(df["Close"].iloc[-1])
-        prev = cur
+    cur, prev = pair
     chg = (cur - prev) / prev * 100 if prev else 0.0
     return cur, chg
+
+def _yf_download_first_ok(tickers: list[str], period="2d", interval="1d"):
+    """
+    Пытается скачать данные по списку тикеров на Yahoo Finance.
+    Возвращает первый непустой DataFrame с валидным Close, иначе None.
+    """
+    for t in tickers:
+        try:
+            df = yf.download(t, period=period, interval=interval, auto_adjust=False, progress=False)
+            if df is not None and not df.empty and "Close" in df.columns and len(df["Close"]) >= 1:
+                last = df["Close"].iloc[-1]
+                if last is not None and not math.isnan(float(last)):
+                    return df
+        except Exception as e:
+            print(f"⚠️ YF error for {t}: {e}")
+    return None
 
 async def get_market_data():
     try:
         print("📊 Получаем рыночные данные...")
-        sp500 = yf.download("^GSPC", period="2d", interval="1d", auto_adjust=False)
-        nasdaq = yf.download("^IXIC", period="2d", interval="1d", auto_adjust=False)
-        dxy = yf.download("DX-Y.NYB", period="2d", interval="1d", auto_adjust=False)
-        gold = yf.download("GC=F", period="2d", interval="1d", auto_adjust=False)
-        oil = yf.download("BZ=F", period="2d", interval="1d", auto_adjust=False)
-        tnx = yf.download("^TNX", period="2d", interval="1d", auto_adjust=False)
+
+        # --- индексы/доллар/нефть/доходности ---
+        sp500 = yf.download("^GSPC", period="2d", interval="1d", auto_adjust=False, progress=False)
+        nasdaq = yf.download("^IXIC", period="2d", interval="1d", auto_adjust=False, progress=False)
+        dxy = yf.download("DX-Y.NYB", period="2d", interval="1d", auto_adjust=False, progress=False)
+        oil = yf.download("BZ=F", period="2d", interval="1d", auto_adjust=False, progress=False)
+        tnx = yf.download("^TNX", period="2d", interval="1d", auto_adjust=False, progress=False)
+
+        # --- золото с fallback ---
+        if FORCE_GOLD_SPOT:
+            gold_df = _yf_download_first_ok(["XAUUSD=X", "GC=F", "MGC=F"], period="2d", interval="1d")
+        else:
+            gold_df = _yf_download_first_ok(["GC=F", "XAUUSD=X", "MGC=F"], period="2d", interval="1d")
 
         market_data = {}
         _pair = _pair_last_close if MARKET_SOURCE_MODE == "last_close" else _pair_intraday
@@ -325,9 +365,13 @@ async def get_market_data():
         _put("sp500", sp500)
         _put("nasdaq", nasdaq)
         _put("dxy", dxy)
-        _put("gold", gold)
         _put("oil", oil)
         _put("treasury", tnx)
+
+        if gold_df is not None:
+            _put("gold", gold_df)
+        else:
+            print("⚠️ Не удалось получить данные по золоту ни по одному тикеру (GC=F/XAUUSD=X/MGC=F).")
 
         for k, (v, c) in market_data.items():
             unit = "$" if k in ("sp500", "nasdaq", "gold", "oil") else ""
@@ -575,7 +619,7 @@ def enforce_len_budget(header: str, body: str, tail: str, max_len: int) -> str:
         trimmed.append(s)
     parts = trimmed
 
-    # при необходимости — удаляем по приоритету для CEO
+    # при необходимости — удаляем по приоритету
     drop_order = ["7️⃣","6️⃣","5️⃣","4️⃣"]
     while total_len(header, parts, tail) > max_len and parts:
         idx = max(range(len(parts)), key=lambda i: len(parts[i]))
@@ -708,7 +752,7 @@ async def send_morning_digest():
 
     # 6) жёсткий лимит и итоговый текст
     full_post = enforce_len_budget(header, body, tail, MAX_CAPTION)
-    print(f"\n================= PREVIEW (console only) =================\n{full_post}\n==========================================================")
+    print(f"\n================= PREVIEW (console) =================\n{full_post}\n====================================================")
     print(f"🧮 Длина поста: {len(full_post)} символов")
 
     # 7) отправка / консоль
@@ -733,8 +777,6 @@ async def send_morning_digest():
             print("✅ Пост отправлен в Telegram!")
         except Exception as e:
             print(f"❌ Ошибка отправки в Telegram: {e}")
-    else:
-        print("🧪 SEND_TO_TELEGRAM=0 — отправка в Telegram отключена, вывод только в консоль.")
 
     # 8) краткая статистика
     print("\n📊 СТАТИСТИКА:")
