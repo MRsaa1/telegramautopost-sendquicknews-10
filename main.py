@@ -25,7 +25,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_RU = os.getenv("TELEGRAM_CHANNEL_RU", "-1002597393191")
 
-# В проде включи переменной окружения SEND_TO_TELEGRAM=1
+# По умолчанию отправляем в Telegram
 SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "1") == "1"   # 1 = слать в TG, 0 = только консоль
 MAX_CAPTION = 1024  # лимит подписи к фото в Telegram
 
@@ -124,6 +124,18 @@ def resize_image_height(image_bytes: BytesIO, target_height: int = 750) -> Bytes
         print(f"❌ Ошибка изменения высоты изображения: {e}")
         image_bytes.seek(0)
         return image_bytes
+
+def _probe_image_size(buf: BytesIO) -> tuple[int, int]:
+    """Определяем размер изображения в буфере, не меняя позицию указателя."""
+    try:
+        pos = buf.tell()
+        img = Image.open(buf)
+        w, h = img.size
+        buf.seek(pos)
+        return w, h
+    except Exception:
+        buf.seek(0)
+        return (0, 0)
 
 # ================== NEWS FRESHNESS/SCORING ==================
 def _utcnow() -> datetime:
@@ -295,15 +307,23 @@ def _safe_close_pair(df):
     if len(df["Close"]) == 0:
         return None
     last = df["Close"].iloc[-1]
-    if last is None or math.isnan(float(last)):
+    try:
+        last_f = float(last)
+    except Exception:
+        return None
+    if math.isnan(last_f):
         return None
     if len(df["Close"]) >= 2:
         prev = df["Close"].iloc[-2]
-        if prev is None or math.isnan(float(prev)):
+        try:
+            prev_f = float(prev)
+        except Exception:
+            return None
+        if math.isnan(prev_f):
             return None
     else:
-        prev = last
-    return last.item(), prev.item()
+        prev_f = last_f
+    return last_f, prev_f
 
 def _pair_last_close(df):
     pair = _safe_close_pair(df)
@@ -331,7 +351,11 @@ def _yf_download_first_ok(tickers: list[str], period="2d", interval="1d"):
             df = yf.download(t, period=period, interval=interval, auto_adjust=False, progress=False)
             if df is not None and not df.empty and "Close" in df.columns and len(df["Close"]) >= 1:
                 last = df["Close"].iloc[-1]
-                if last is not None and not math.isnan(float(last)):
+                try:
+                    last_f = float(last)
+                except Exception:
+                    continue
+                if not math.isnan(last_f):
                     return df
         except Exception as e:
             print(f"⚠️ YF error for {t}: {e}")
@@ -407,15 +431,31 @@ async def get_morning_image() -> BytesIO | None:
         print("🖼️ Генерация изображения пропущена (SEND_TO_TELEGRAM=0).")
         return None
 
-    if static_image_exists():
-        print("✅ Используем сохранённое статичное изображение")
-        cached = load_static_image()
-        if cached:
-            return cached
-        print("⚠️ Кэш повреждён — генерирую новое…")
-
-    print("🎨 Генерируем новое статичное изображение…")
     try:
+        # 1) Если есть кэш — проверим высоту и при необходимости досжать
+        if static_image_exists():
+            cached = load_static_image()
+            if cached:
+                w, h = _probe_image_size(cached)
+                print(f"🖼️ Кэш-изображение: {w}x{h}px")
+                if h > TARGET_IMAGE_HEIGHT:
+                    print(f"↘️ Уменьшаем высоту кэша до {TARGET_IMAGE_HEIGHT}px…")
+                    resized = resize_image_height(cached, target_height=TARGET_IMAGE_HEIGHT)
+                    save_static_image(resized)
+                    recached = load_static_image()
+                    if recached:
+                        w2, h2 = _probe_image_size(recached)
+                        print(f"✅ Кэш обновлён: {w2}x{h2}px")
+                        return recached
+                    resized.seek(0)
+                    return resized
+                cached.seek(0)
+                return cached
+            else:
+                print("⚠️ Кэш повреждён — сгенерируем заново…")
+
+        # 2) Генерим новое, сразу уменьшаем высоту, сохраняем в кэш
+        print("🎨 Генерируем новое статичное изображение…")
         client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
         prompt = (
             "Digital illustration, fun but professional, modern flat style, soft colors. "
@@ -430,17 +470,24 @@ async def get_morning_image() -> BytesIO | None:
         )
         img_url = resp.data[0].url
         buf = BytesIO(requests.get(img_url, timeout=20).content)
+        w0, h0 = _probe_image_size(buf)
+        print(f"🖼️ Новое изображение до сжатия: {w0}x{h0}px")
 
         resized = resize_image_height(buf, target_height=TARGET_IMAGE_HEIGHT)
+        w1, h1 = _probe_image_size(resized)
+        print(f"🖼️ После сжатия: {w1}x{h1}px")
 
         if save_static_image(resized):
-            cached = load_static_image()
-            if cached:
-                return cached
+            recached = load_static_image()
+            if recached:
+                w2, h2 = _probe_image_size(recached)
+                print(f"✅ Сохранено в кэш: {w2}x{h2}px")
+                return recached
         resized.seek(0)
         return resized
+
     except Exception as e:
-        print(f"❌ Ошибка генерации изображения: {e}")
+        print(f"❌ Ошибка генерации/сжатия изображения: {e}")
         return None
 
 # ================== DIGEST BUILD HELPERS (пост-обработка) ==================
@@ -597,6 +644,59 @@ def normalize_sections_spacing(text: str) -> str:
         fixed.append(line.strip())
     return "\n\n".join([l for l in fixed if l])
 
+def ceo_multiline_layout(digest: str) -> str:
+    """
+    Для 4–7 делаем формат:
+    4️⃣ Монетарная политика:
+    🧭 Текст...
+    И вычищаем повтор категории внутри текста («Монетарная политика — …»).
+    """
+    if not digest:
+        return ""
+
+    title_by_tag = {
+        "4️⃣": "Монетарная политика",
+        "5️⃣": "Корпоративные новости",
+        "6️⃣": "Криптовалюты",
+        "7️⃣": "Геополитика",
+    }
+    default_emoji = {"4️⃣":"🧭","5️⃣":"🏢","6️⃣":"🚀","7️⃣":"🌍"}
+
+    out = []
+    lines = [l for l in digest.splitlines() if l.strip()]
+    for line in lines:
+        s = line.strip()
+        if not s[:2] in ("4️⃣","5️⃣","6️⃣","7️⃣"):
+            out.append(s)
+            continue
+
+        tag = s[:2]
+        rest = s[2:].strip()
+        head, body = (rest.split(":", 1) + [""])[:2]
+        head = (head.strip() or title_by_tag[tag]).strip()
+        body = body.strip()
+
+        emoji = ""
+        if body and body[0] in ("📊","📈","🏦","🧭","🏢","🚀","🌍"):
+            emoji, body = body[0], body[1:].lstrip()
+        emoji = emoji or default_emoji[tag]
+
+        base = title_by_tag[tag].lower()
+        for sep in ("— ", "- ", ": ", " — ", " - ", " : "):
+            patt = (base + sep).lower()
+            if body.lower().startswith(patt):
+                body = body[len(patt):].lstrip()
+                break
+
+        out.append(f"{tag} {head}:")
+        out.append(f"{emoji} {body}" if body else f"{emoji}")
+        out.append("")
+
+    while out and out[-1] == "":
+        out.pop()
+
+    return "\n".join(out)
+
 def enforce_len_budget(header: str, body: str, tail: str, max_len: int) -> str:
     """
     Сначала мягко укорачиваем самые длинные строки (≈180→≈160→≈100),
@@ -723,6 +823,7 @@ async def send_morning_digest():
         lines[0] = mood_line
     digest = "\n\n".join(lines)
     digest = normalize_sections_spacing(digest)
+    digest = ceo_multiline_layout(digest)                       # двухстрочная верстка 4–7 без дублей
 
     # 4) шапка/подпись
     now_local = datetime.now(LOCAL_TZ)
