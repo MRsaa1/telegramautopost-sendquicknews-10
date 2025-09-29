@@ -510,7 +510,7 @@ async def send_morning_digest():
     header = f"🌅 Утренняя сводка — {now_local:%d.%m.%Y}"
     tail = SIGNATURE
 
-    # 7) Крипто-«хвост» (ТОП-5) — по желанию, добавляем в конце
+    # 7) Крипто-«хвост» (ТОП-5), добавляем в конце
     crypto_section = ""
     if crypto_data:
         lines = ["💎 Криптовалюты (ТОП-5)"]
