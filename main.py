@@ -24,7 +24,7 @@ from telegram import Bot
 
 # ================== CONFIG ==================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "0") == "1"  # True для отправки
+SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "1") == "1"  # ✅ ВКЛЮЧЕНО по умолчанию
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHANNEL_RU = os.getenv("TELEGRAM_CHANNEL_RU", "-1002597393191")
 
@@ -622,7 +622,8 @@ async def send_morning_digest():
             print("⚠️ Используем placeholder изображение")
             image = _placeholder_image()
     else:
-        print("⚠️ OpenAI API недоступен, изображение не будет сгенерировано")
+        print("⚠️ OpenAI API недоступен, используем placeholder изображение")
+        image = _placeholder_image()
 
     # ====== ОТПРАВКА В TELEGRAM ======
     if SEND_TO_TELEGRAM and TELEGRAM_TOKEN:
@@ -652,7 +653,7 @@ async def send_morning_digest():
         except Exception as e:
             print(f"❌ Ошибка отправки в Telegram: {e}")
     else:
-        print("ℹ️ Отправка в Telegram отключена (SEND_TO_TELEGRAM=0)")
+        print("ℹ️ Отправка в Telegram отключена (SEND_TO_TELEGRAM=0 или нет TELEGRAM_TOKEN)")
 
     # ====== PREVIEW В КОНСОЛИ ======
     print(f"\n================= PREVIEW (console) =================")
@@ -669,7 +670,7 @@ async def send_morning_digest():
     print(f"• Изображение: {'✅ сгенерировано' if image else '❌ нет'}")
     print(f"• Окно свежести: {FRESHNESS_HOURS_MORNING} ч")
     print(f"• Источник рынков: {MARKET_SOURCE_MODE}")
-    print(f"• Отправка в TG: {'✅ включена' if SEND_TO_TELEGRAM else '❌ выключена'}")
+    print(f"• Отправка в TG: {'✅ ВКЛЮЧЕНА' if SEND_TO_TELEGRAM else '❌ выключена'}")
 
 if __name__ == "__main__":
     asyncio.run(send_morning_digest())
